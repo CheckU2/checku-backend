@@ -1,61 +1,155 @@
-from datetime import datetime,timezone
+"""GPS experimental: referencia del teléfono docente; estados NO modifican asistencia.
+No sirve como prueba concluyente a 1 m. Solo reporta salidas con margen de precisión.
+"""
+from datetime import datetime, timezone
+from uuid import uuid4
+from math import isfinite
 from bson import ObjectId
-from fastapi import APIRouter,Depends,HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from app.database import get_database
 from app.dependencies import get_current_user
-from app.routers.academic.generic import serialize,audit
-router=APIRouter(prefix="/proximity",tags=["Proximidad"])
+from app.routers.academic.generic import serialize, audit
+
+router = APIRouter(prefix='/proximity', tags=['Proximidad'])
+RADIUS_M = 1.0
+GRACE_SECONDS = 120
+
 def dbx():
- d=get_database()
- if d is None: raise HTTPException(503,detail={"code":"DATABASE_UNAVAILABLE","message":"Base de datos no disponible"})
- return d
-def auth_session(db,sid,user):
- if not ObjectId.is_valid(sid): raise HTTPException(400,detail={"code":"INVALID_ID","message":"Identificador inválido"})
- s=db.class_sessions.find_one({"_id":ObjectId(sid)})
- if not s: raise HTTPException(404,detail={"code":"NOT_FOUND","message":"Sesión no encontrada"})
- if user.get("role") not in {"super_admin","admin"} and s.get("teacher_id")!=str(user["_id"]): raise HTTPException(403,detail={"code":"FORBIDDEN","message":"Sin permisos"})
- return s
-@router.post("/sessions/{session_id}/activate")
-def activate(session_id:str,payload:dict,user=Depends(get_current_user)):
- db=dbx(); s=auth_session(db,session_id,user)
- if s.get("status")!="active": raise HTTPException(409,detail={"code":"SESSION_NOT_ACTIVE","message":"La clase no está activa"})
- profile=payload.get("profile","standard")
- if profile not in {"conservative","standard","strict"}: raise HTTPException(422,detail={"code":"INVALID_PROFILE","message":"Perfil no permitido"})
- db.class_sessions.update_one({"_id":s["_id"]},{"$set":{"proximity_enabled":True,"proximity_profile":profile,"proximity_activated_at":datetime.now(timezone.utc)}})
- audit(db,user,"proximity_activate","class_sessions",session_id)
- return {"success":True,"data":{"session_id":session_id,"enabled":True,"profile":profile}}
-@router.post("/sessions/{session_id}/deactivate")
-def deactivate(session_id:str,user=Depends(get_current_user)):
- db=dbx(); s=auth_session(db,session_id,user); db.class_sessions.update_one({"_id":s["_id"]},{"$set":{"proximity_enabled":False,"proximity_deactivated_at":datetime.now(timezone.utc)}})
- return {"success":True,"data":{"enabled":False}}
-@router.post("/sessions/{session_id}/challenge")
-def challenge(session_id:str,user=Depends(get_current_user)):
- db=dbx(); s=auth_session(db,session_id,user)
- if not s.get("proximity_enabled"): raise HTTPException(409,detail={"code":"PROXIMITY_DISABLED","message":"Proximidad desactivada"})
- token=__import__("secrets").token_urlsafe(24); now=datetime.now(timezone.utc)
- db.proximity_challenges.insert_one({"session_id":session_id,"token_hash":__import__("hashlib").sha256(token.encode()).hexdigest(),"created_at":now,"expires_at":now.replace(second=now.second)+__import__("datetime").timedelta(seconds=60)})
- return {"success":True,"data":{"challenge":token,"expires_in_seconds":60}}
-@router.post("/sessions/{session_id}/check-in")
-def proximity_checkin(session_id:str,payload:dict,user=Depends(get_current_user)):
- if user.get("role")!="student": raise HTTPException(403,detail={"code":"STUDENT_ONLY","message":"Solo alumnos pueden reportar proximidad"})
- db=dbx(); s=db.class_sessions.find_one({"_id":ObjectId(session_id),"status":"active"}) if ObjectId.is_valid(session_id) else None
- if not s or not s.get("proximity_enabled"): raise HTTPException(409,detail={"code":"PROXIMITY_DISABLED","message":"Proximidad no disponible"})
- return {"success":True,"data":{"accepted":True,"review_required":True,"message":"La proximidad es evidencia auxiliar y requiere múltiples lecturas."}}
-@router.post("/sessions/{session_id}/events",status_code=201)
-def event(session_id:str,payload:dict,user=Depends(get_current_user)):
- if user.get("role")!="student": raise HTTPException(403,detail={"code":"STUDENT_ONLY","message":"Solo alumnos pueden enviar eventos"})
- db=dbx(); s=db.class_sessions.find_one({"_id":ObjectId(session_id),"status":"active"}) if ObjectId.is_valid(session_id) else None
- if not s or not s.get("proximity_enabled"): raise HTTPException(409,detail={"code":"PROXIMITY_DISABLED","message":"Proximidad no disponible"})
- kind=payload.get("kind"); confidence=payload.get("confidence",0)
- if kind not in {"inside","outside","return","uncertain"} or not isinstance(confidence,(int,float)) or not 0<=confidence<=1: raise HTTPException(422,detail={"code":"INVALID_EVENT","message":"Evento inválido"})
- now=datetime.now(timezone.utc); doc={"session_id":session_id,"student_id":str(user["_id"]),"kind":kind,"confidence":confidence,"source":str(payload.get("source","unknown"))[:40],"status":"pending_review","created_at":now}
- res=db.proximity_events.insert_one(doc); doc["_id"]=res.inserted_id
- return {"success":True,"data":serialize(doc)}
-@router.get("/sessions/{session_id}/status")
-def status(session_id:str,user=Depends(get_current_user)):
- db=dbx(); s=auth_session(db,session_id,user)
- return {"success":True,"data":{"enabled":s.get("proximity_enabled",False),"profile":s.get("proximity_profile")}}
-@router.get("/sessions/{session_id}/events")
-def events(session_id:str,user=Depends(get_current_user)):
- db=dbx(); auth_session(db,session_id,user)
- return {"success":True,"data":[serialize(x) for x in db.proximity_events.find({"session_id":session_id}).sort("created_at",-1).limit(500)]}
+    db = get_database()
+    if db is None: raise HTTPException(503, detail={'message': 'Base de datos no disponible'})
+    return db
+
+def session(db, sid):
+    if not ObjectId.is_valid(sid): raise HTTPException(422, detail={'message': 'Sesión inválida'})
+    doc = db.class_sessions.find_one({'_id': ObjectId(sid)})
+    if not doc: raise HTTPException(404, detail={'message': 'Sesión no encontrada'})
+    return doc
+
+def teacher_allowed(db, doc, user):
+    role = user.get('role')
+    if role in ('admin', 'super_admin'): return True
+    if role == 'career_admin': return str(doc.get('career_id')) == str(user.get('career_id'))
+    return role == 'teacher' and str(doc.get('teacher_id')) == str(user['_id'])
+
+def student_allowed(db, doc, user):
+    if user.get('role') != 'student': return False
+    cid = str(doc.get('class_id', ''))
+    return ObjectId.is_valid(cid) and db.class_memberships.find_one({'class_id': ObjectId(cid), 'student_id': str(user['_id'])}) is not None
+
+def has_attendance(db, sid, user):
+    return db.attendance.find_one({'session_id': sid, 'user_id': user['_id'], 'status': {'$in': ['present', 'late']}}) is not None or db.attendance.find_one({'session_id': sid, 'student_id': str(user['_id']), 'status': {'$in': ['present', 'late']}}) is not None
+
+def number(payload, key, lower, upper):
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or not lower <= value <= upper:
+        raise HTTPException(422, detail={'message': f'{key} inválido'})
+    return float(value)
+
+@router.post('/sessions/{session_id}/anchor')
+def set_anchor(session_id: str, payload: dict, user=Depends(get_current_user)):
+    db = dbx(); doc = session(db, session_id)
+    if not teacher_allowed(db, doc, user): raise HTTPException(403, detail={'message': 'Solo el docente responsable puede publicar el punto de referencia'})
+    if doc.get('status') != 'active': raise HTTPException(409, detail={'message': 'La sesión no está en curso'})
+    latitude = number(payload, 'latitude', -90, 90)
+    longitude = number(payload, 'longitude', -180, 180)
+    accuracy = number(payload, 'accuracy_m', 0, 100000)
+    now = datetime.now(timezone.utc)
+    anchor = {'latitude': latitude, 'longitude': longitude, 'accuracy_m': accuracy, 'recorded_at': now, 'source': 'teacher_phone_gps'}
+    db.class_sessions.update_one({'_id': doc['_id']}, {'$set': {'proximity_anchor': anchor, 'proximity_enabled': True, 'proximity_radius_m': RADIUS_M, 'proximity_grace_seconds': GRACE_SECONDS}})
+    audit(db, user, 'proximity_anchor', 'class_sessions', session_id)
+    return {'success': True, 'data': {'enabled': True, 'anchor': serialize(anchor), 'radius_m': RADIUS_M, 'grace_seconds': GRACE_SECONDS}}
+
+@router.get('/sessions/{session_id}/reference')
+def reference(session_id: str, user=Depends(get_current_user)):
+    db = dbx(); doc = session(db, session_id)
+    if not (teacher_allowed(db, doc, user) or student_allowed(db, doc, user)):
+        raise HTTPException(403, detail={'message': 'Sin acceso a esta sesión'})
+    if doc.get('status') != 'active': raise HTTPException(409, detail={'message': 'La sesión ya no está activa'})
+    if user.get('role') == 'student' and not has_attendance(db, session_id, user):
+        raise HTTPException(403, detail={'message': 'Registra primero tu asistencia'})
+    anchor = doc.get('proximity_anchor')
+    return {'success': True, 'data': {'enabled': bool(anchor and doc.get('proximity_enabled')), 'anchor': serialize(anchor) if anchor else None, 'radius_m': RADIUS_M, 'grace_seconds': GRACE_SECONDS}}
+
+@router.post('/sessions/{session_id}/events')
+def event(session_id: str, payload: dict, user=Depends(get_current_user)):
+    db = dbx(); doc = session(db, session_id)
+    if not student_allowed(db, doc, user) or not has_attendance(db, session_id, user):
+        raise HTTPException(403, detail={'message': 'Solo alumnos inscritos con asistencia registrada'})
+    if doc.get('status') != 'active' or not doc.get('proximity_enabled') or not (doc.get('proximity_anchor') or doc.get('proximity_ble_uuid')):
+        raise HTTPException(409, detail={'message': 'Proximidad no disponible'})
+    kind = payload.get('kind')
+    if kind not in ('inside', 'outside', 'uncertain'):
+        raise HTTPException(422, detail={'message': 'Estado inválido'})
+    # Nunca se reciben coordenadas del estudiante. La decisión local incluye el margen de error.
+    now = datetime.now(timezone.utc)
+    key = {'session_id': session_id, 'student_id': str(user['_id'])}
+    previous = db.proximity_states.find_one(key) or {}
+    outside_since = previous.get('outside_since')
+    if outside_since is not None and outside_since.tzinfo is None:
+        outside_since = outside_since.replace(tzinfo=timezone.utc)
+    if kind == 'inside':
+        outside_since = None
+        state = 'present'
+    elif kind == 'uncertain':
+        # No acumular tiempo cuando la señal es incierta.
+        outside_since = None
+        state = 'uncertain'
+    else:
+        if outside_since is None: outside_since = now
+        state = 'possible_abandonment' if (now - outside_since).total_seconds() >= GRACE_SECONDS else 'observing'
+    doc_state = {'state': state, 'last_kind': kind, 'outside_since': outside_since, 'updated_at': now, 'requires_review': state == 'possible_abandonment'}
+    changed = state != previous.get('state') or (outside_since is None) != (previous.get('outside_since') is None)
+    previous_update = previous.get('updated_at')
+    if previous_update is not None and previous_update.tzinfo is None:
+        previous_update = previous_update.replace(tzinfo=timezone.utc)
+    stale = previous_update is None or (now - previous_update).total_seconds() >= 60
+    # Una escritura por cambio de estado; en estado estable, como máximo una por minuto.
+    if changed or stale:
+        db.proximity_states.update_one(key, {'$set': doc_state}, upsert=True)
+    if changed:
+        db.proximity_events.insert_one({**key, **doc_state, 'source': 'ble_android_experimental' if doc.get('proximity_ble_uuid') else 'gps_experimental', 'created_at': now})
+    return {'success': True, 'data': {'state': state, 'outside_since': outside_since.isoformat() if outside_since else None, 'remaining_seconds': max(0, GRACE_SECONDS - int((now - outside_since).total_seconds())) if outside_since else 0, 'requires_review': state == 'possible_abandonment'}}
+
+@router.get('/sessions/{session_id}/events')
+def events(session_id: str, user=Depends(get_current_user)):
+    db = dbx(); doc = session(db, session_id)
+    if not teacher_allowed(db, doc, user): raise HTTPException(403, detail={'message': 'Sin permisos'})
+    rows = list(db.proximity_states.find({'session_id': session_id}).limit(300))
+    ids = [ObjectId(r['student_id']) for r in rows if ObjectId.is_valid(r['student_id'])]
+    names = {str(x['_id']): x.get('full_name', 'Alumno') for x in db.users.find({'_id': {'$in': ids}}, {'full_name': 1})}
+    for r in rows: r['full_name'] = names.get(r['student_id'], 'Alumno')
+    return {'success': True, 'data': [serialize(x) for x in rows]}
+
+@router.post('/sessions/{session_id}/deactivate')
+def deactivate(session_id: str, user=Depends(get_current_user)):
+    db = dbx(); doc = session(db, session_id)
+    if not teacher_allowed(db, doc, user): raise HTTPException(403, detail={'message': 'Sin permisos'})
+    db.class_sessions.update_one({'_id': doc['_id']}, {'$set': {'proximity_enabled': False}})
+    return {'success': True, 'data': {'enabled': False}}
+
+
+@router.post('/sessions/{session_id}/ble/start')
+def ble_start(session_id: str, user=Depends(get_current_user)):
+    """Activate an opaque per-session BLE service UUID. One DB update only per activation."""
+    db = dbx(); doc = session(db, session_id)
+    # Do not permit administrators or tutors to impersonate the session teacher's phone.
+    if user.get('role') != 'teacher' or str(doc.get('teacher_id')) != str(user['_id']):
+        raise HTTPException(403, detail={'message': 'Solo el docente de la sesión puede activar el emisor BLE'})
+    if doc.get('status') != 'active': raise HTTPException(409, detail={'message': 'La sesión no está activa'})
+    token = doc.get('proximity_ble_uuid')
+    if not token:
+        token = str(uuid4())
+        db.class_sessions.update_one({'_id': doc['_id'], 'status': 'active'},
+            {'$set': {'proximity_ble_uuid': token, 'proximity_enabled': True, 'proximity_grace_seconds': GRACE_SECONDS}})
+    elif not doc.get('proximity_enabled'):
+        db.class_sessions.update_one({'_id': doc['_id']}, {'$set': {'proximity_enabled': True}})
+    return {'success': True, 'data': {'service_uuid': token, 'grace_seconds': GRACE_SECONDS}}
+
+@router.get('/sessions/{session_id}/ble/config')
+def ble_config(session_id: str, user=Depends(get_current_user)):
+    db = dbx(); doc = session(db, session_id)
+    if not student_allowed(db, doc, user) or not has_attendance(db, session_id, user):
+        raise HTTPException(403, detail={'message': 'Se requiere inscripción y asistencia registrada'})
+    if doc.get('status') != 'active' or not doc.get('proximity_enabled') or not doc.get('proximity_ble_uuid'):
+        raise HTTPException(409, detail={'message': 'El docente aún no ha activado Bluetooth'})
+    return {'success': True, 'data': {'service_uuid': doc['proximity_ble_uuid'], 'grace_seconds': GRACE_SECONDS}}

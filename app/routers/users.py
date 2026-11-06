@@ -161,3 +161,66 @@ def delete_avatar(current=Depends(get_current_user)):
         except OSError: pass
     db.users.update_one({"_id":current["_id"]},{"$unset":{"avatar_path":"","avatar_content_type":""},"$set":{"updated_at":datetime.now(timezone.utc)}})
     return {"success":True,"data":{"deleted":True}}
+
+
+@router.get("/{user_id}/avatar")
+def classmate_avatar(user_id: str, current=Depends(get_current_user)):
+    """Serve either legacy inline avatars or uploaded photos to authorized class members."""
+    import base64
+    import re
+    from io import BytesIO
+    from pathlib import Path
+    from fastapi.responses import FileResponse, StreamingResponse
+    if not ObjectId.is_valid(user_id):
+        raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "Foto no encontrada"})
+    db = dbx()
+    target_id = ObjectId(user_id)
+    uid = str(current['_id'])
+    if target_id != current['_id'] and current.get('role') not in {'super_admin', 'admin'}:
+        # Both string and ObjectId membership IDs are supported for legacy data.
+        member_classes = [m['class_id'] for m in db.class_memberships.find(
+            {'student_id': {'$in': [user_id, target_id]}}, {'class_id': 1})]
+        normalized = {str(cid) for cid in member_classes if ObjectId.is_valid(str(cid))}
+        refs = list(normalized) + [ObjectId(cid) for cid in normalized]
+        if current.get('role') == 'career_admin':
+            owner = db.users.find_one({'_id': target_id}, {'career_id': 1})
+            if owner and str(owner.get('career_id')) == str(current.get('career_id')):
+                refs = ['same_career']
+        if not refs:
+            raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "Foto no encontrada"})
+        role = current.get('role')
+        if role == 'student':
+            allowed = db.class_memberships.find_one({
+                'student_id': {'$in': [uid, current['_id']]}, 'class_id': {'$in': refs}}, {'_id': 1})
+        elif role == 'teacher':
+            allowed = db.classes.find_one({'_id': {'$in': [ObjectId(x) for x in normalized]},
+                                           'teacher_id': {'$in': [uid, current['_id']]}}, {'_id': 1})
+        elif role == 'career_admin' and refs == ['same_career']:
+            allowed = True
+        elif role in {'tutor', 'career_admin'}:
+            # Reuse the same academic scope checks as the class roster.
+            from app.routers.academic.classes import scope
+            allowed = db.classes.find_one({'_id': {'$in': [ObjectId(x) for x in normalized]},
+                                           **scope(db, current)}, {'_id': 1})
+        else:
+            allowed = None
+        if not allowed:
+            raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "Foto no encontrada"})
+    person = db.users.find_one({'_id': target_id, 'is_active': {'$ne': False}},
+                               {'avatar_path': 1, 'avatar': 1})
+    if not person:
+        raise HTTPException(404, detail={"code": "AVATAR_NOT_FOUND", "message": "Foto no encontrada"})
+    path = person.get('avatar_path')
+    if path and Path(path).is_file():
+        return FileResponse(path, media_type='image/jpeg', headers={'Cache-Control': 'private, max-age=300'})
+    inline = person.get('avatar')
+    match = re.fullmatch(r'data:image/(png|jpeg|webp);base64,([A-Za-z0-9+/=]+)', inline or '')
+    if match:
+        try:
+            raw = base64.b64decode(match.group(2), validate=True)
+            if 20 <= len(raw) <= 250000:
+                return StreamingResponse(BytesIO(raw), media_type=f'image/{match.group(1)}',
+                                         headers={'Cache-Control': 'private, max-age=300'})
+        except (ValueError, base64.binascii.Error):
+            pass
+    raise HTTPException(404, detail={"code": "AVATAR_NOT_FOUND", "message": "Foto no encontrada"})

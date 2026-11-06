@@ -349,14 +349,36 @@ def create_subject_for_class(payload: dict, user=Depends(get_current_user)):
 
 @router.get('/{class_id}/students')
 def class_students(class_id: str, user=Depends(get_current_user)):
+    """Complete class roster, restricted to actual class members and assigned staff."""
     db = database()
-    doc = db.classes.find_one({'_id': oid(class_id, 'clase'), **scope(db, user)})
-    if not doc or user['role'] == 'student':
-        fail(403, 'FORBIDDEN', 'No puedes consultar esta lista')
-    memberships = list(db.class_memberships.find({'class_id': doc['_id']}))
-    ids = [ObjectId(m['student_id']) for m in memberships if ObjectId.is_valid(m.get('student_id'))]
-    students = [serialize(u) for u in db.users.find({'_id': {'$in': ids}}, {'email': 1, 'full_name': 1, 'student_id': 1})]
-    return {'success': True, 'data': students}
+    class_oid = oid(class_id, 'clase')
+    doc = db.classes.find_one({'_id': class_oid}, {'_id': 1})
+    if not doc:
+        fail(404, 'CLASS_NOT_FOUND', 'Clase no encontrada')
+    uid = str(user['_id'])
+    # Historical membership documents may contain string or ObjectId identifiers.
+    class_refs = [class_oid, str(class_oid)]
+    if user['role'] == 'student':
+        member = db.class_memberships.find_one({
+            'class_id': {'$in': class_refs},
+            'student_id': {'$in': [uid, user['_id']]}
+        }, {'_id': 1})
+        if not member:
+            fail(403, 'FORBIDDEN', 'No perteneces a esta clase')
+    elif not db.classes.find_one({'_id': class_oid, **scope(db, user)}, {'_id': 1}):
+        fail(403, 'FORBIDDEN', 'No puedes consultar esta clase')
+    memberships = db.class_memberships.find({'class_id': {'$in': class_refs}}, {'student_id': 1})
+    ids = list({ObjectId(str(m['student_id'])) for m in memberships
+                if ObjectId.is_valid(str(m.get('student_id', '')))})
+    if not ids:
+        return {'success': True, 'data': []}
+    students = db.users.find({'_id': {'$in': ids}, 'is_active': {'$ne': False}},
+                             {'full_name': 1, 'avatar_path': 1, 'avatar': 1})
+    rows = [{'id': str(u['_id']), 'full_name': u.get('full_name') or 'Alumno',
+             'avatar_url': f"/api/v1/users/{u['_id']}/avatar" if u.get('avatar_path') or u.get('avatar') else None}
+            for u in students]
+    rows.sort(key=lambda u: u['full_name'].casefold())
+    return {'success': True, 'data': rows}
 
 
 @router.post('/{class_id}/invite-tutor')

@@ -16,4 +16,4 @@ def create_user(*,email,password,role,full_name,career_id=None):
  document["_id"]=result.inserted_id
  return document
 def public_user(user):
- return {"id":str(user["_id"]),"email":user["email"],"role":user["role"],"full_name":user["full_name"],"is_active":user.get("is_active",False),"career_id":user.get("career_id"),"created_at":user["created_at"], "avatar":user.get("avatar"), "bio":user.get("bio", ""), "banner_color":user.get("banner_color", "#63B89F")}
+ return {"id":str(user["_id"]),"email":user["email"],"role":user["role"],"full_name":user["full_name"],"is_active":user.get("is_active",False),"career_id":user.get("career_id"),"created_at":user["created_at"], "avatar":user.get("avatar"), "avatar_url": "/api/v1/users/me/avatar" if user.get("avatar_path") else None, "bio":user.get("bio", ""), "banner_color":user.get("banner_color", "#63B89F")}

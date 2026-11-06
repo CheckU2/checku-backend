@@ -50,3 +50,5 @@ def ensure_indexes(db) -> None:
         unique=True, partialFilterExpression={'subject_period_key': {'$type': 'string'}})
     db.class_tutor_invitations.create_index([('class_id', 1), ('tutor_id', 1)], unique=True)
     db.audit_logs.create_index([("created_at", -1)])
+    db.proximity_states.create_index([("session_id", 1), ("student_id", 1)], unique=True)
+    db.proximity_events.create_index([("session_id", 1), ("created_at", -1)])
