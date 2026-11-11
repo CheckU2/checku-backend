@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     refresh_token_expire_days: int = 30
     password_reset_expire_minutes: int = 30
     institutional_timezone: str = "America/Mexico_City"
-    cors_origins: str = "http://localhost:5173,http://localhost:8081,http://localhost:19006"
+    cors_origins: str = "http://localhost:5173,http://localhost:8081,http://localhost:19006,https://checku-web.vercel.app"
     bootstrap_admin_email: str = ""
     bootstrap_admin_password: str = ""
     smtp_host: str = ""
