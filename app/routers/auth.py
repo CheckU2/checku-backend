@@ -6,11 +6,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pymongo.errors import PyMongoError
 from app.config import get_settings
 from app.database import get_database
-from app.dependencies import get_current_user
+from app.dependencies import get_current_user, get_current_identity
 from app.schemas.auth import LoginRequest, RegisterRequest
 from app.security import verify_password, create_access_token, hash_password, token_hash, opaque_token
 from app.services.users import create_user, public_user
 from app.services.email import send_password_reset_email
+from app.services.institutions import institution, valid_timezone, now_utc
+from app.services.authorization import apply_user_context, resolve_user_context, user_contexts
 
 router=APIRouter(prefix="/auth",tags=["Autenticación"])
 _attempts=defaultdict(deque)
@@ -19,20 +21,74 @@ def rate_limit(request: Request, key: str, maximum: int=10, window: int=60):
     while bucket and bucket[0] < now-window: bucket.popleft()
     if len(bucket)>=maximum: raise HTTPException(429,detail={"code":"RATE_LIMITED","message":"Demasiadas solicitudes; inténtalo más tarde"})
     bucket.append(now)
-def issue_tokens(db,user):
+def issue_tokens(db,user,context=None):
     settings=get_settings(); now=datetime.now(timezone.utc)
+    if context is not None:
+        context=resolve_user_context(db,user,context)
     refresh=opaque_token()
     db.refresh_sessions.insert_one({"user_id":user["_id"],"token_hash":token_hash(refresh),"created_at":now,
-       "expires_at":now+timedelta(days=settings.refresh_token_expire_days),"revoked_at":None})
-    access=create_access_token(str(user["_id"]),user["role"])
+       "expires_at":now+timedelta(days=settings.refresh_token_expire_days),"revoked_at":None,"context":context})
+    access=create_access_token(str(user["_id"]),user["role"],context=context)
     return {"access_token":access,"refresh_token":refresh,"token_type":"bearer","expires_in":settings.access_token_expire_minutes*60}
+
+def auth_user_response(db,user,context=None):
+    contexts=user_contexts(db,user)
+    active_context=resolve_user_context(db,user,context) if context is not None else None
+    response_user=apply_user_context(user,active_context) if active_context else user
+    result=public_user(response_user)
+    result["contexts"]=contexts
+    result["active_context"]=active_context
+    return result
 
 @router.post("/register",status_code=201)
 def register(payload:RegisterRequest):
     s=get_settings()
     if not s.public_registration_enabled: raise HTTPException(403,detail={"code":"REGISTRATION_DISABLED","message":"El registro público está deshabilitado"})
     try:
-        user=create_user(email=str(payload.email),password=payload.password,role="student",full_name=payload.full_name)
+        if payload.account_type not in ("student", "teacher"):
+            raise HTTPException(422,detail={"code":"INVALID_ACCOUNT_TYPE","message":"Tipo de cuenta inválido"})
+        db=get_database()
+        if db is None: raise RuntimeError("MongoDB no disponible")
+        if payload.institution_id:
+            inst=institution(db,payload.institution_id)
+            if not s.multi_institution_registration_enabled:
+                raise HTTPException(403,detail={"code":"FEATURE_DISABLED","message":"Registro multiinstitucional aún no habilitado"})
+            if payload.account_type == "student" and not payload.career_id:
+                raise HTTPException(422,detail={"code":"CAREER_REQUIRED","message":"Selecciona tu carrera"})
+            if payload.career_id:
+                if not ObjectId.is_valid(payload.career_id) or not db.careers.find_one({"_id":ObjectId(payload.career_id),"institution_id":payload.institution_id,"is_deleted":{"$ne":True}}):
+                    raise HTTPException(422,detail={"code":"INVALID_CAREER","message":"Carrera no pertenece a la institución"})
+        elif payload.career_id or payload.account_type=="teacher":
+            raise HTTPException(422,detail={"code":"INSTITUTION_REQUIRED","message":"Selecciona una institución"})
+        zone=valid_timezone(payload.timezone) if payload.timezone else None
+        # Teacher registration never grants teaching privileges without institutional approval.
+        user=create_user(email=str(payload.email),password=payload.password,role="student",full_name=payload.full_name,
+                         career_id=payload.career_id,institution_id=payload.institution_id,timezone_name=zone)
+        if payload.institution_id:
+            db.users.update_one({"_id":user["_id"]},{"$set":{"account_type":payload.account_type}})
+            user["account_type"]=payload.account_type
+            membership_status="pending" if payload.account_type=="teacher" else "active"
+            db.institution_memberships.insert_one({"institution_id":payload.institution_id,"user_id":str(user["_id"]),
+                "status":membership_status,"joined_at":now_utc()})
+            if payload.account_type=="student":
+                db.role_assignments.update_one(
+                    {"institution_id":payload.institution_id,"user_id":str(user["_id"]),"role":"student","scope_type":"career","scope_id":payload.career_id},
+                    {"$set":{"status":"active","granted_at":now_utc()}},
+                    upsert=True,
+                )
+            else:
+                db.role_requests.insert_one({
+                    "user_id":str(user["_id"]),
+                    "institution_id":payload.institution_id,
+                    "requested_role":"teacher",
+                    "scope_type":"career" if payload.career_id else "institution",
+                    "scope_id":payload.career_id,
+                    "status":"pending",
+                    "created_at":now_utc(),
+                    "reviewed_by":None,
+                    "reviewed_at":None,
+                    "reason":None,
+                })
         return {"success":True,"data":public_user(user),"message":"Cuenta creada correctamente"}
     except ValueError as exc: raise HTTPException(409,detail={"code":"EMAIL_EXISTS","message":str(exc)})
     except RuntimeError: raise HTTPException(503,detail={"code":"DATABASE_UNAVAILABLE","message":"Base de datos no disponible"})
@@ -46,7 +102,18 @@ def login(payload:LoginRequest,request:Request):
     user=db.users.find_one({"email":str(payload.email).lower().strip()})
     if not user or not user.get("is_active",False) or not verify_password(payload.password,user.get("password_hash","")):
         raise HTTPException(401,detail={"code":"INVALID_CREDENTIALS","message":"Correo o contraseña incorrectos"})
-    return {"success":True,"data":{**issue_tokens(db,user),"user":public_user(user)}}
+    contexts=user_contexts(db,user)
+    context=contexts[0] if len(contexts)==1 else None
+    return {"success":True,"data":{**issue_tokens(db,user,context),"user":auth_user_response(db,user,context)}}
+
+@router.post("/context")
+def select_context(payload:dict,user=Depends(get_current_identity)):
+    db=get_database()
+    if db is None: raise HTTPException(503,detail={"code":"DATABASE_UNAVAILABLE","message":"Base de datos no disponible"})
+    base_user=db.users.find_one({"_id":user["_id"],"is_active":True})
+    if not base_user: raise HTTPException(401,detail={"code":"USER_INACTIVE_OR_MISSING","message":"Usuario no disponible"})
+    context=resolve_user_context(db,base_user,payload)
+    return {"success":True,"data":{**issue_tokens(db,base_user,context),"user":auth_user_response(db,base_user,context)}}
 
 @router.post("/refresh")
 def refresh(payload:dict):
@@ -61,7 +128,8 @@ def refresh(payload:dict):
     if consumed.modified_count!=1: raise HTTPException(401,detail={"code":"REFRESH_REUSED","message":"La sesión ya fue renovada"})
     user=db.users.find_one({"_id":old["user_id"],"is_active":True})
     if not user: raise HTTPException(401,detail={"code":"USER_INACTIVE","message":"Usuario no disponible"})
-    return {"success":True,"data":issue_tokens(db,user)}
+    context=old.get("context")
+    return {"success":True,"data":issue_tokens(db,user,context)}
 
 @router.post("/logout")
 def logout(payload:dict,request:Request,user=Depends(get_current_user)):
@@ -85,7 +153,10 @@ def logout_all(user=Depends(get_current_user)):
     return {"success":True,"data":{"message":"Se revocaron las sesiones renovables"}}
 
 @router.get("/me")
-def me(user=Depends(get_current_user)): return {"success":True,"data":public_user(user)}
+def me(user=Depends(get_current_user)):
+    db=get_database()
+    context=user.get("active_context")
+    return {"success":True,"data":auth_user_response(db,user,context)}
 
 @router.post("/forgot-password")
 def forgot_password(payload:dict,request:Request):
@@ -137,6 +208,8 @@ def change_password(payload:dict,user=Depends(get_current_user)):
 def update_my_profile(payload: dict, user=Depends(get_current_user)):
     db = get_database()
     changes = {}
+    if 'timezone' in payload:
+        changes['timezone'] = valid_timezone(payload['timezone'])
     if 'full_name' in payload:
         name = str(payload['full_name']).strip()
         if not 2 <= len(name) <= 120:

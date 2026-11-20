@@ -1,5 +1,4 @@
 from contextlib import asynccontextmanager
-from zoneinfo import ZoneInfo
 from fastapi import FastAPI,Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -31,4 +30,4 @@ async def unhandled_exception_handler(request:Request,exc:Exception):
  return JSONResponse(status_code=500,content={"success":False,"error":{"code":"INTERNAL_ERROR","message":"Ocurrió un error interno"}})
 app.include_router(api_router,prefix=settings.api_v1_prefix)
 @app.get("/",tags=["Sistema"])
-def root(): return {"success":True,"data":{"name":settings.app_name,"docs":"/docs" if settings.app_env.lower()!="production" else "OpenAPI deshabilitado por política de despliegue","timezone":settings.institutional_timezone}}
+def root(): return {"success":True,"data":{"name":settings.app_name,"docs":"/docs" if settings.app_env.lower()!="production" else "OpenAPI deshabilitado por política de despliegue"}}

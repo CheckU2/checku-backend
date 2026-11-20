@@ -4,9 +4,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import jwt
 from app.database import get_database
 from app.security import decode_access_token
+from app.services.authorization import apply_user_context, resolve_user_context
 
 bearer_scheme = HTTPBearer(auto_error=False)
-def get_current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme)):
+
+def _authenticated_user(credentials, apply_context):
     if credentials is None:
         raise HTTPException(401, detail={"code":"AUTH_REQUIRED","message":"Autenticación requerida"})
     try:
@@ -20,7 +22,19 @@ def get_current_user(credentials: HTTPAuthorizationCredentials | None = Depends(
         raise HTTPException(401, detail={"code":"TOKEN_REVOKED","message":"Sesión revocada"})
     user=db.users.find_one({"_id":ObjectId(uid),"is_active":True})
     if not user: raise HTTPException(401, detail={"code":"USER_INACTIVE_OR_MISSING","message":"Usuario no disponible"})
+    context=payload.get("context")
+    if apply_context and context is not None:
+        user=apply_user_context(user,resolve_user_context(db,user,context))
     return user
+
+
+def get_current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme)):
+    return _authenticated_user(credentials, apply_context=True)
+
+
+def get_current_identity(credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme)):
+    return _authenticated_user(credentials, apply_context=False)
+
 
 def require_roles(*roles: str):
     def checker(user=Depends(get_current_user)):

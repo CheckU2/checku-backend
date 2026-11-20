@@ -5,14 +5,27 @@ _client: MongoClient | None = None
 
 def connect_database() -> None:
     global _client
+
     settings = get_settings()
+
     if not settings.mongodb_uri:
         return
+
     if _client is not None:
         return
-    _client = MongoClient(settings.mongodb_uri, serverSelectionTimeoutMS=5000, connectTimeoutMS=5000,
-                          socketTimeoutMS=10000, maxPoolSize=100, minPoolSize=2, waitQueueTimeoutMS=5000,
-                          appname="CheckU-FastAPI", retryWrites=True)
+
+    _client = MongoClient(
+        settings.mongodb_uri,
+        serverSelectionTimeoutMS=5000,
+        connectTimeoutMS=5000,
+        socketTimeoutMS=10000,
+        maxPoolSize=100,
+        minPoolSize=0,
+        waitQueueTimeoutMS=5000,
+        appname="CheckU-FastAPI",
+        retryWrites=True,
+        connect=False,
+    )
 
 def close_database() -> None:
     global _client
@@ -37,6 +50,10 @@ def ping_database() -> bool:
 
 def ensure_indexes(db) -> None:
     db.users.create_index("email", unique=True)
+    db.institutions.create_index("slug",unique=True)
+    db.institution_memberships.create_index([("institution_id",1),("user_id",1)],unique=True)
+    db.role_assignments.create_index([("institution_id",1),("user_id",1),("role",1),("scope_type",1),("scope_id",1)],unique=True)
+    db.role_requests.create_index([("institution_id",1),("status",1),("created_at",-1)])
     db.users.create_index([("role", 1), ("is_active", 1)])
     db.refresh_sessions.create_index("expires_at", expireAfterSeconds=0)
     db.password_reset_tokens.create_index("expires_at", expireAfterSeconds=0)

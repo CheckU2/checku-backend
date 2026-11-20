@@ -1,17 +1,16 @@
-"""GPS experimental: referencia del teléfono docente; estados NO modifican asistencia.
-No sirve como prueba concluyente a 1 m. Solo reporta salidas con margen de precisión.
-"""
+"""Referencia GPS del docente y eventos de permanencia durante la sesión."""
 from datetime import datetime, timezone
 from uuid import uuid4
-from math import isfinite
+from math import asin, cos, isfinite, radians, sin
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException
 from app.database import get_database
 from app.dependencies import get_current_user
 from app.routers.academic.generic import serialize, audit
+from app.routers.academic.sessions import student_session_query, teacher_session_query
 
 router = APIRouter(prefix='/proximity', tags=['Proximidad'])
-RADIUS_M = 1.0
+RADIUS_M = 50.0
 GRACE_SECONDS = 120
 
 def dbx():
@@ -29,12 +28,11 @@ def teacher_allowed(db, doc, user):
     role = user.get('role')
     if role in ('admin', 'super_admin'): return True
     if role == 'career_admin': return str(doc.get('career_id')) == str(user.get('career_id'))
-    return role == 'teacher' and str(doc.get('teacher_id')) == str(user['_id'])
+    return role == 'teacher' and db.class_sessions.find_one({'_id': doc['_id'], **teacher_session_query(db, user)}, {'_id': 1}) is not None
 
 def student_allowed(db, doc, user):
     if user.get('role') != 'student': return False
-    cid = str(doc.get('class_id', ''))
-    return ObjectId.is_valid(cid) and db.class_memberships.find_one({'class_id': ObjectId(cid), 'student_id': str(user['_id'])}) is not None
+    return db.class_sessions.find_one({'$and': [{'_id': doc['_id']}, student_session_query(db, user)]}, {'_id': 1}) is not None
 
 def has_attendance(db, sid, user):
     return db.attendance.find_one({'session_id': sid, 'user_id': user['_id'], 'status': {'$in': ['present', 'late']}}) is not None or db.attendance.find_one({'session_id': sid, 'student_id': str(user['_id']), 'status': {'$in': ['present', 'late']}}) is not None
@@ -45,17 +43,56 @@ def number(payload, key, lower, upper):
         raise HTTPException(422, detail={'message': f'{key} inválido'})
     return float(value)
 
+def verify_checkin_location(doc, position):
+    anchor = doc.get('proximity_anchor')
+    if not doc.get('proximity_enabled') or not anchor or doc.get('proximity_radius_m') != RADIUS_M:
+        raise HTTPException(409, detail={'message': 'El docente debe generar un QR con ubicación GPS.'})
+    if not isinstance(position, dict):
+        raise HTTPException(422, detail={'message': 'Se requiere la ubicación del alumno.'})
+    distance, uncertainty = distance_from_anchor(anchor, position)
+    if position['accuracy_m'] > 25:
+        raise HTTPException(422, detail={'message': 'La precisión del GPS es insuficiente.'})
+    if distance + uncertainty > RADIUS_M:
+        raise HTTPException(403, detail={'message': 'El GPS no pudo confirmar que estás dentro de 50 m del docente.'})
+
+
+def distance_from_anchor(anchor, position):
+    lat = radians(number(position, 'latitude', -90, 90))
+    lon = radians(number(position, 'longitude', -180, 180))
+    accuracy = number(position, 'accuracy_m', 0, 100000)
+    anchor_lat = radians(number(anchor, 'latitude', -90, 90))
+    anchor_lon = radians(number(anchor, 'longitude', -180, 180))
+    anchor_accuracy = number(anchor, 'accuracy_m', 0, 25)
+    h = sin((lat - anchor_lat) / 2)**2 + cos(lat) * cos(anchor_lat) * sin((lon - anchor_lon) / 2)**2
+    distance = 6371000 * 2 * asin(min(1, h**0.5))
+    return distance, accuracy + anchor_accuracy
+
+
+def gps_settings(position, now):
+    if not isinstance(position, dict):
+        raise HTTPException(422, detail={'message': 'Ubicación del docente inválida.'})
+    anchor = {
+        'latitude': number(position, 'latitude', -90, 90),
+        'longitude': number(position, 'longitude', -180, 180),
+        'accuracy_m': number(position, 'accuracy_m', 0, 25),
+        'recorded_at': now,
+        'source': 'teacher_phone_gps',
+    }
+    return {
+        'proximity_anchor': anchor, 'proximity_enabled': True,
+        'proximity_radius_m': RADIUS_M, 'proximity_grace_seconds': GRACE_SECONDS,
+        'gps_checkin_required': True,
+    }
+
+
 @router.post('/sessions/{session_id}/anchor')
 def set_anchor(session_id: str, payload: dict, user=Depends(get_current_user)):
     db = dbx(); doc = session(db, session_id)
     if not teacher_allowed(db, doc, user): raise HTTPException(403, detail={'message': 'Solo el docente responsable puede publicar el punto de referencia'})
     if doc.get('status') != 'active': raise HTTPException(409, detail={'message': 'La sesión no está en curso'})
-    latitude = number(payload, 'latitude', -90, 90)
-    longitude = number(payload, 'longitude', -180, 180)
-    accuracy = number(payload, 'accuracy_m', 0, 100000)
-    now = datetime.now(timezone.utc)
-    anchor = {'latitude': latitude, 'longitude': longitude, 'accuracy_m': accuracy, 'recorded_at': now, 'source': 'teacher_phone_gps'}
-    db.class_sessions.update_one({'_id': doc['_id']}, {'$set': {'proximity_anchor': anchor, 'proximity_enabled': True, 'proximity_radius_m': RADIUS_M, 'proximity_grace_seconds': GRACE_SECONDS}})
+    settings = gps_settings(payload, datetime.now(timezone.utc))
+    anchor = settings['proximity_anchor']
+    db.class_sessions.update_one({'_id': doc['_id']}, {'$set': settings})
     audit(db, user, 'proximity_anchor', 'class_sessions', session_id)
     return {'success': True, 'data': {'enabled': True, 'anchor': serialize(anchor), 'radius_m': RADIUS_M, 'grace_seconds': GRACE_SECONDS}}
 
@@ -68,7 +105,7 @@ def reference(session_id: str, user=Depends(get_current_user)):
     if user.get('role') == 'student' and not has_attendance(db, session_id, user):
         raise HTTPException(403, detail={'message': 'Registra primero tu asistencia'})
     anchor = doc.get('proximity_anchor')
-    return {'success': True, 'data': {'enabled': bool(anchor and doc.get('proximity_enabled')), 'anchor': serialize(anchor) if anchor else None, 'radius_m': RADIUS_M, 'grace_seconds': GRACE_SECONDS}}
+    return {'success': True, 'data': {'enabled': bool(anchor and doc.get('proximity_enabled')), 'anchor': serialize(anchor) if anchor and user.get('role') != 'student' else None, 'radius_m': RADIUS_M, 'grace_seconds': GRACE_SECONDS}}
 
 @router.post('/sessions/{session_id}/events')
 def event(session_id: str, payload: dict, user=Depends(get_current_user)):
@@ -78,9 +115,20 @@ def event(session_id: str, payload: dict, user=Depends(get_current_user)):
     if doc.get('status') != 'active' or not doc.get('proximity_enabled') or not (doc.get('proximity_anchor') or doc.get('proximity_ble_uuid')):
         raise HTTPException(409, detail={'message': 'Proximidad no disponible'})
     kind = payload.get('kind')
+    if doc.get('gps_checkin_required'):
+        position = payload.get('location')
+        if isinstance(position, dict):
+            distance, uncertainty = distance_from_anchor(doc['proximity_anchor'], position)
+            if uncertainty <= RADIUS_M and distance - uncertainty > RADIUS_M:
+                kind = 'outside'
+            elif distance + uncertainty <= RADIUS_M:
+                kind = 'inside'
+            else:
+                kind = 'uncertain'
+        elif kind != 'uncertain':
+            raise HTTPException(422, detail={'message': 'Se requiere una lectura de GPS.'})
     if kind not in ('inside', 'outside', 'uncertain'):
         raise HTTPException(422, detail={'message': 'Estado inválido'})
-    # Nunca se reciben coordenadas del estudiante. La decisión local incluye el margen de error.
     now = datetime.now(timezone.utc)
     key = {'session_id': session_id, 'student_id': str(user['_id'])}
     previous = db.proximity_states.find_one(key) or {}

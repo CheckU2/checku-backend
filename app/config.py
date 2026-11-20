@@ -15,7 +15,6 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 10
     refresh_token_expire_days: int = 30
     password_reset_expire_minutes: int = 30
-    institutional_timezone: str = "America/Mexico_City"
     cors_origins: str = "http://localhost:5173,http://localhost:8081,http://localhost:19006,https://checku-web.vercel.app"
     bootstrap_admin_email: str = ""
     bootstrap_admin_password: str = ""
@@ -26,6 +25,7 @@ class Settings(BaseSettings):
     smtp_from_email: str = ""
     smtp_use_tls: bool = True
     public_registration_enabled: bool = True
+    multi_institution_registration_enabled: bool = False
     qr_challenge_ttl_seconds: int = 60
     password_reset_base_url: str = "http://localhost:5173/reset-password"
     upload_dir: str = "private_uploads"
@@ -40,10 +40,6 @@ class Settings(BaseSettings):
             raise ValueError("JWT_SECRET_KEY debe tener al menos 32 caracteres en producción")
         if not 1 <= self.access_token_expire_minutes <= 60:
             raise ValueError("ACCESS_TOKEN_EXPIRE_MINUTES debe estar entre 1 y 60")
-        if self.institutional_timezone != "America/Mexico_City":
-            # Other IANA zones are permitted if institutional policy changes.
-            from zoneinfo import ZoneInfo
-            ZoneInfo(self.institutional_timezone)
         return self
 
 @lru_cache

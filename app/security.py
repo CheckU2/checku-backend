@@ -10,11 +10,14 @@ def verify_password(password: str, password_hash: str) -> bool:
     except Exception: return False
 def token_hash(token: str) -> str: return hashlib.sha256(token.encode()).hexdigest()
 def opaque_token() -> str: return secrets.token_urlsafe(40)
-def create_access_token(subject: str, role: str, jti: str | None = None) -> str:
+def create_access_token(subject: str, role: str, jti: str | None = None, context: dict | None = None) -> str:
     s=get_settings()
     if len(s.jwt_secret_key)<32: raise RuntimeError("JWT_SECRET_KEY debe configurarse con al menos 32 caracteres")
     now=datetime.now(timezone.utc)
-    return jwt.encode({"sub":subject,"role":role,"iat":now,"exp":now+timedelta(minutes=s.access_token_expire_minutes),"type":"access","jti":jti or secrets.token_urlsafe(18)},s.jwt_secret_key,algorithm=s.jwt_algorithm)
+    payload={"sub":subject,"role":role,"iat":now,"exp":now+timedelta(minutes=s.access_token_expire_minutes),"type":"access","jti":jti or secrets.token_urlsafe(18)}
+    if context is not None:
+        payload["context"] = context
+    return jwt.encode(payload,s.jwt_secret_key,algorithm=s.jwt_algorithm)
 def decode_access_token(token: str) -> dict:
     s=get_settings()
     if len(s.jwt_secret_key)<32: raise RuntimeError("JWT_SECRET_KEY no está configurada correctamente")
