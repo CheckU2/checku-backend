@@ -8,10 +8,23 @@ from pymongo.errors import DuplicateKeyError
 from app.database import get_database
 from app.dependencies import get_current_user
 from app.routers.academic.generic import serialize, audit
+from app.services.institutions import institution_career_refs
+from app.services.academic_catalogs import INSTITUTION_ADMINS, catalog_scope
 
 router = APIRouter(prefix='/classes', tags=['Clases e inscripción'])
 MANAGERS = {'admin', 'super_admin', 'career_admin', 'tutor', 'teacher'}
-ALPHABET = string.digits
+GENERATED_CODE_CHARACTERS = string.ascii_uppercase + string.digits
+JOIN_CODE_CHARACTERS = string.ascii_letters + string.digits
+
+
+def generate_join_code():
+    characters = [
+        secrets.choice(string.ascii_uppercase),
+        secrets.choice(string.digits),
+        *(secrets.choice(GENERATED_CODE_CHARACTERS) for _ in range(4)),
+    ]
+    secrets.SystemRandom().shuffle(characters)
+    return ''.join(characters)
 
 
 def fail(status, code, message):
@@ -35,7 +48,7 @@ def managed_career(db, user, requested):
     role = user['role']
     if role in {'admin', 'super_admin'}:
         cid = requested
-    elif role == 'career_admin':
+    elif role == 'career_admin' or (role in {'teacher', 'tutor'} and user.get('institution_id')):
         cid = user.get('career_id')
     elif role in {'tutor', 'teacher'}:
         profile = db['tutors' if role == 'tutor' else 'teachers'].find_one({'user_id': str(user['_id']), 'is_active': {'$ne': False}, 'is_deleted': {'$ne': True}})
@@ -46,18 +59,70 @@ def managed_career(db, user, requested):
         fail(403, 'SCOPE_MISSING', 'Tu cuenta no tiene una carrera autorizada')
     if requested and role not in {'admin', 'super_admin'} and str(requested) != str(cid):
         fail(403, 'FORBIDDEN', 'No puedes administrar otra carrera')
-    if not db.careers.find_one({'_id': oid(str(cid), 'carrera'), 'is_deleted': {'$ne': True}}):
+    career_query={'_id': oid(str(cid), 'carrera'), 'is_deleted': {'$ne': True}}
+    if user.get('institution_id'):
+        career_query['institution_id']=user['institution_id']
+    if not db.careers.find_one(career_query):
         fail(422, 'CAREER_NOT_FOUND', 'Carrera inexistente')
     return str(cid)
+
+
+def id_refs(value):
+    value = str(value)
+    return [value, ObjectId(value)] if ObjectId.is_valid(value) else [value]
+
+
+def assigned_tutor_ids(db, cls, institution_id=None):
+    group = str(cls.get('group_id', ''))
+    if institution_id:
+        assignments = db.role_assignments.find({
+            'institution_id': institution_id, 'role': 'tutor', 'scope_type': 'group',
+            'scope_id': {'$in': id_refs(group)}, 'status': 'active',
+        }, {'user_id': 1})
+        candidates = [ref for row in assignments for ref in id_refs(row.get('user_id'))]
+        memberships = db.institution_memberships.find({
+            'institution_id': institution_id, 'status': 'active', 'user_id': {'$in': candidates},
+        }, {'user_id': 1})
+        refs = {str(row['user_id']) for row in memberships}
+    else:
+        refs = set(map(str, cls.get('tutor_ids') or []))
+        for assignment in db.tutor_assignments.find({
+            'group_id': {'$in': id_refs(group)}, 'is_active': {'$ne': False},
+            'is_deleted': {'$ne': True},
+        }):
+            ref = str(assignment.get('tutor_id', ''))
+            if ObjectId.is_valid(ref):
+                profile = db.tutors.find_one({'_id': ObjectId(ref)})
+                if not profile or (profile.get('is_active') is not False and not profile.get('is_deleted')):
+                    refs.add(str((profile or {}).get('user_id', ref)))
+    ids = [ObjectId(ref) for ref in refs if ObjectId.is_valid(ref)]
+    return sorted(row['_id'] for row in db.users.find({
+        '_id': {'$in': ids}, 'is_active': {'$ne': False}, 'is_deleted': {'$ne': True},
+    }, {'_id': 1}))
+
+
+def institutional_class_scope(db, user):
+    return {
+        'career_id': {'$in': institution_career_refs(db, user)},
+        'institution_id': {'$in': [user['institution_id'], None]},
+        'is_deleted': {'$ne': True},
+    }
 
 
 def tutor_group_ids(db, user):
     """Asignaciones de grupo explícitas; no confundir tutor con profesor de materia."""
     uid = str(user['_id'])
-    profile = db.tutors.find_one({'user_id': uid, 'is_deleted': {'$ne': True}})
-    refs = [uid]
+    if user.get('institution_id'):
+        return list({
+            str(row["scope_id"]) for row in db.role_assignments.find({
+                "institution_id": user["institution_id"], "user_id": {"$in": id_refs(uid)},
+                "role": "tutor", "scope_type": "group", "career_id": {"$in": id_refs(user.get("career_id"))}, "status": "active",
+            }, {"scope_id": 1}) if ObjectId.is_valid(str(row.get("scope_id")))
+        })
+    profile = db.tutors.find_one({'user_id': {'$in': id_refs(uid)}, 'is_active': {'$ne': False}, 'is_deleted': {'$ne': True}})
+    refs = id_refs(uid)
     if profile:
-        refs.append(str(profile['_id']))
+        refs.extend(id_refs(profile['_id']))
     return list({str(x['group_id']) for x in db.tutor_assignments.find({
         'tutor_id': {'$in': refs}, 'group_id': {'$exists': True},
         'is_active': {'$ne': False}, 'is_deleted': {'$ne': True}
@@ -69,18 +134,39 @@ def scope(db, user):
     uid = str(user['_id'])
     if role in {'admin', 'super_admin'}:
         return {}
+    if role in INSTITUTION_ADMINS:
+        return institutional_class_scope(db, user)
     if role == 'career_admin':
-        return {'career_id': managed_career(db, user, None)}
+        career = managed_career(db, user, None)
+        return institutional_class_scope(db, user) if user.get('institution_id') else {
+            'career_id': {'$in': id_refs(career)}, 'is_deleted': {'$ne': True}}
     if role == 'tutor':
         career = managed_career(db, user, None)
-        groups = tutor_group_ids(db, user)
-        return {'career_id': career, '$or': [
-            {'group_id': {'$in': groups}}, {'tutor_ids': uid}
-        ]}
+        groups = [ref for group in tutor_group_ids(db, user) for ref in id_refs(group)]
+        query = {'career_id': {'$in': id_refs(career)}, 'group_id': {'$in': groups}, 'is_deleted': {'$ne': True}}
+        if user.get('institution_id'):
+            query['institution_id'] = {'$in': [user['institution_id'], None]}
+        if not user.get('institution_id'):
+            query.pop('group_id')
+            query['$or'] = [{'group_id': {'$in': groups}}, {'tutor_ids': {'$in': id_refs(uid)}}]
+        return query
     if role == 'teacher':
-        return {'teacher_id': uid}
+        query={'is_deleted': {'$ne': True}, 'teacher_id': {'$in': [uid, ObjectId(uid)]} if ObjectId.is_valid(uid) else uid}
+        if user.get('institution_id'):
+            query.update(institutional_class_scope(db, user))
+            context = user.get('active_context') or {}
+            if context.get('scope_type') == 'class':
+                query['_id'] = {'$in': [ref for ref in id_refs(context.get('scope_id')) if isinstance(ref, ObjectId)]}
+        return query
     if role == 'student':
-        return {'_id': {'$in': [x['class_id'] for x in db.class_memberships.find({'student_id': uid}, {'class_id': 1})]}}
+        memberships = db.class_memberships.find({'student_id': {'$in': id_refs(uid)}}, {'class_id': 1})
+        query = {'_id': {'$in': [ObjectId(str(x['class_id'])) for x in memberships
+                               if ObjectId.is_valid(str(x.get('class_id')))]}}
+        if user.get('institution_id'):
+            query.update(institutional_class_scope(db, user))
+            if not user.get('career_id'):
+                query['career_id'] = {'$in': []}
+        return query
     fail(403, 'FORBIDDEN', 'Sin permisos')
 
 
@@ -100,22 +186,59 @@ def class_details(db, doc):
     return row
 
 
-def validate_relations(db, payload, career):
+def validate_relations(db, payload, career, actor):
+    institutional = bool(actor.get('institution_id'))
     for field, coll in [('subject_id', 'subjects'), ('group_id', 'groups'), ('period_id', 'academic_periods')]:
         value = payload.get(field)
         if not value:
             fail(422, 'REQUIRED_FIELD', f'Falta {field}')
-        doc = db[coll].find_one({'_id': oid(value, field), 'is_deleted': {'$ne': True}})
+        filters = catalog_scope(db, {**actor, 'career_id': career}, coll) if institutional else {'is_deleted': {'$ne': True}}
+        doc = db[coll].find_one({'_id': oid(value, field), **filters})
         if not doc or (doc.get('career_id') and str(doc['career_id']) != career):
             fail(422, 'INVALID_RELATION', f'{field} no pertenece a la carrera seleccionada')
+        if institutional and field == 'group_id' and doc.get('period_id') and str(doc['period_id']) != str(payload.get('period_id')):
+            fail(422, 'INVALID_PERIOD', 'Selecciona el periodo académico del grupo')
     teacher_id = payload.get('teacher_id')
-    teacher = db.teachers.find_one({'_id': oid(teacher_id, 'docente'), 'is_deleted': {'$ne': True}, 'is_active': {'$ne': False}})
-    if not teacher or (teacher.get('career_id') and str(teacher['career_id']) != career):
+    teacher_query = {'_id': oid(teacher_id, 'docente'), 'is_deleted': {'$ne': True}, 'is_active': {'$ne': False}}
+    if institutional:
+        teacher_query.update(career_id={'$in': id_refs(career)},
+                             institution_id={'$in': [actor['institution_id'], None]})
+    teacher = db.teachers.find_one(teacher_query)
+    if not teacher or (not institutional and teacher.get('career_id') and str(teacher['career_id']) != career):
         fail(422, 'INVALID_TEACHER', 'El docente no pertenece a la carrera')
-    user = db.users.find_one({'_id': oid(str(teacher['user_id']), 'usuario docente'), 'role': 'teacher', 'is_active': {'$ne': False}})
+    account_query = {'_id': oid(str(teacher['user_id']), 'usuario docente'), 'is_active': {'$ne': False}}
+    if institutional:
+        assignment = db.role_assignments.find_one({
+            'institution_id': actor['institution_id'], 'user_id': {'$in': id_refs(teacher['user_id'])},
+            'role': 'teacher', 'scope_type': 'career', 'scope_id': career, 'status': 'active',
+        })
+        if not assignment:
+            fail(422, 'INVALID_TEACHER', 'Asigna primero el rol de docente en esta carrera')
+    else:
+        account_query['role'] = 'teacher'
+    user = db.users.find_one(account_query)
     if not user:
         fail(422, 'INVALID_TEACHER', 'El perfil docente no tiene una cuenta activa')
     return str(user['_id'])
+
+
+def ensure_student_class_scope(db, user, class_doc):
+    career_id = user.get('career_id')
+    institution_id = user.get('institution_id')
+    if institution_id:
+        if class_doc.get('institution_id') not in (None, institution_id):
+            fail(403, 'CAREER_INSTITUTION_MISMATCH', 'La clase no pertenece a tu institución')
+        if not career_id:
+            fail(403, 'CAREER_REQUIRED', 'Tu cuenta no tiene una carrera autorizada')
+        career = db.careers.find_one({
+            '_id': oid(str(career_id), 'carrera'),
+            'institution_id': institution_id,
+            'is_deleted': {'$ne': True},
+        })
+        if not career:
+            fail(403, 'CAREER_INSTITUTION_MISMATCH', 'Tu carrera no pertenece a tu institución')
+    if career_id and str(career_id) != str(class_doc.get('career_id')):
+        fail(403, 'CAREER_MISMATCH', 'La clase pertenece a otra carrera')
 
 
 @router.get('/options')
@@ -128,11 +251,21 @@ def class_options(user=Depends(get_current_user)):
     career = None if role in {'admin', 'super_admin'} else managed_career(db, user, None)
     def records(collection):
         query = {'is_deleted': {'$ne': True}, 'is_active': {'$ne': False}}
-        if career:
+        if user.get('institution_id') and collection in {'subjects', 'groups', 'academic_periods'}:
+            query.update(catalog_scope(db, {**user, 'career_id': career}, collection))
+        elif user.get('institution_id') and collection == 'teachers':
+            assignments = db.role_assignments.find({
+                'institution_id': user['institution_id'], 'role': 'teacher',
+                'scope_type': 'career', 'scope_id': career, 'status': 'active',
+            }, {'user_id': 1})
+            query['user_id'] = {'$in': [ref for item in assignments for ref in id_refs(item['user_id'])]}
+            query['career_id'] = {'$in': id_refs(career)}
+            query['institution_id'] = {'$in': [user['institution_id'], None]}
+        elif career:
             # Los periodos pueden ser institucionales y no tener carrera.
             query['$or'] = [{'career_id': career}, {'career_id': {'$exists': False}}] if collection == 'academic_periods' else [{'career_id': career}]
         return [serialize(doc) for doc in db[collection].find(query).limit(300)]
-    teachers = records('teachers')
+    teachers = [] if role == 'teacher' else records('teachers')
     allowed_groups = set(tutor_group_ids(db, user)) if role == 'tutor' else None
     for teacher in teachers:
         uid = teacher.get('user_id')
@@ -143,8 +276,55 @@ def class_options(user=Depends(get_current_user)):
         'subjects': records('subjects'), 'groups': [g for g in records('groups') if allowed_groups is None or str(g.get('id') or g.get('_id')) in allowed_groups],
         'academic-periods': records('academic_periods'), 'teachers': teachers,
         'assigned_career_id': career,
-        'tutors': [dict(serialize(p), full_name=(db.users.find_one({'_id': ObjectId(p['user_id'])}, {'full_name': 1}) or {}).get('full_name', 'Tutor')) for p in db.tutors.find({'career_id': career, 'is_deleted': {'$ne': True}}) if ObjectId.is_valid(str(p.get('user_id', '')))] if career else [],
+        'tutors': [dict(serialize(p), full_name=(db.users.find_one({'_id': ObjectId(p['user_id'])}, {'full_name': 1}) or {}).get('full_name', 'Tutor')) for p in db.tutors.find({'career_id': career, 'is_deleted': {'$ne': True}}) if ObjectId.is_valid(str(p.get('user_id', '')))] if career and not user.get('institution_id') else [],
     }}
+
+
+@router.post('/groups', status_code=201)
+def create_tutor_group(payload: dict, user=Depends(get_current_user)):
+    if user['role'] != 'tutor':
+        fail(403, 'FORBIDDEN', 'Solo tutores')
+    from app.services.academic_catalogs import validate_group_period
+
+    db = database()
+    career = managed_career(db, user, None)
+    name = str(payload.get('name') or '').strip()
+    code = str(payload.get('code') or '').strip()
+    if not 1 <= len(name) <= 120 or not 1 <= len(code) <= 40:
+        fail(422, 'INVALID_GROUP', 'Indica el nombre y clave del grupo')
+    institution = user.get('institution_id')
+    uid = str(user['_id'])
+    period = payload.get('period_id')
+    now = datetime.now(timezone.utc)
+    group = {'_id': ObjectId(), 'name': name, 'code': code, 'period_id': period, 'career_id': career,
+             'institution_id': institution, 'created_at': now, 'updated_at': now, 'created_by': uid}
+    if institution:
+        validate_group_period(db, user, group, require_active=True)
+    elif not db.academic_periods.find_one({
+        '_id': oid(period, 'periodo'), 'institution_id': None,
+        'career_id': {'$in': [*id_refs(career), None]}, 'is_active': {'$ne': False}, 'is_deleted': {'$ne': True},
+    }):
+        fail(422, 'INVALID_PERIOD', 'Selecciona un periodo disponible para tu carrera')
+    if db.groups.find_one({'institution_id': institution, 'career_id': career, 'period_id': period,
+                           'code': code, 'is_deleted': {'$ne': True}}):
+        fail(409, 'DUPLICATE_GROUP', 'Esta clave ya existe en el periodo')
+    db.groups.insert_one(group)
+    try:
+        if institution:
+            db.role_assignments.insert_one({
+                'institution_id': institution, 'user_id': uid, 'role': 'tutor', 'scope_type': 'group',
+                'scope_id': str(group['_id']), 'career_id': career, 'status': 'active', 'granted_by': uid, 'granted_at': now,
+            })
+        else:
+            db.tutor_assignments.insert_one({
+                'tutor_id': uid, 'group_id': str(group['_id']), 'career_id': career,
+                'is_active': True, 'created_at': now,
+            })
+    except Exception:
+        db.groups.update_one({'_id': group['_id']}, {'$set': {'is_deleted': True}})
+        raise
+    audit(db, user, 'create', 'groups', str(group['_id']))
+    return {'success': True, 'data': serialize(group)}
 
 
 @router.post('', status_code=201)
@@ -156,18 +336,24 @@ def create_class(payload: dict, user=Depends(get_current_user)):
     if user['role'] == 'tutor' and str(payload.get('group_id')) not in tutor_group_ids(db, user):
         fail(403, 'GROUP_NOT_ASSIGNED', 'No tienes asignado este grupo')
     if user['role'] == 'teacher':
-        profile = db.teachers.find_one({'user_id': str(user['_id']), 'is_deleted': {'$ne': True}})
+        profile_query = {'user_id': {'$in': id_refs(user['_id'])}, 'is_deleted': {'$ne': True}}
+        if user.get('institution_id'):
+            profile_query.update(career_id={'$in': id_refs(career)},
+                                 institution_id={'$in': [user['institution_id'], None]})
+        profile = db.teachers.find_one(profile_query)
         if not profile:
             fail(403, 'TEACHER_PROFILE_MISSING', 'Tu cuenta no tiene perfil docente')
         payload['teacher_id'] = str(profile['_id'])
-    teacher_user_id = validate_relations(db, payload, career)
+    teacher_user_id = validate_relations(db, payload, career, user)
     now = datetime.now(timezone.utc)
     data = {'career_id': career, 'subject_id': payload['subject_id'], 'group_id': payload['group_id'],
             'period_id': payload['period_id'], 'teacher_id': teacher_user_id,
             'enrollment_open': True, 'is_active': True, 'created_at': now, 'updated_at': now,
             'created_by': str(user['_id']), 'tutor_ids': []}
+    if user.get('institution_id'):
+        data['institution_id'] = user['institution_id']
     for _ in range(15):
-        data['join_code'] = ''.join(secrets.choice(ALPHABET) for _ in range(6))
+        data['join_code'] = generate_join_code()
         try:
             result = db.classes.insert_one(data)
             data['_id'] = result.inserted_id
@@ -180,10 +366,26 @@ def create_class(payload: dict, user=Depends(get_current_user)):
 
 
 @router.get('')
-def list_classes(page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100), user=Depends(get_current_user)):
+def list_classes(page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100),
+                 career_id: str | None = None, group_id: str | None = None, period_id: str | None = None,
+                 search: str | None = Query(None, max_length=80), user=Depends(get_current_user)):
+    from re import escape
     db = database()
     query = scope(db, user)
     query['is_active'] = {'$ne': False}
+    filters = [query]
+    for key, value in (('career_id', career_id), ('group_id', group_id), ('period_id', period_id)):
+        if value:
+            filters.append({key: {'$in': id_refs(oid(value, key))}})
+    if search and search.strip():
+        term = {'$regex': escape(search.strip()), '$options': 'i'}
+        any_match = []
+        for field, collection, name in (('subject_id', 'subjects', 'name'), ('group_id', 'groups', 'name'),
+                                         ('teacher_id', 'users', 'full_name'), ('period_id', 'academic_periods', 'name')):
+            rows = db[collection].find({name: term}, {'_id': 1})
+            any_match.append({field: {'$in': [ref for row in rows for ref in id_refs(row['_id'])]}})
+        filters.append({'$or': any_match})
+    query = {'$and': filters} if len(filters) > 1 else query
     total = db.classes.count_documents(query)
     raw = list(db.classes.find(query).sort('created_at', -1).skip((page-1)*limit).limit(limit))
     lookup = {}
@@ -207,28 +409,28 @@ def list_classes(page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=100
 def join_class(payload: dict, user=Depends(get_current_user)):
     if user['role'] != 'student':
         fail(403, 'FORBIDDEN', 'Solo los alumnos pueden inscribirse con código')
-    code = str(payload.get('code', '')).strip().upper()
-    if len(code) != 6 or any(c not in ALPHABET for c in code):
-        fail(422, 'INVALID_CODE', 'El código debe tener seis dígitos')
+    code = str(payload.get('code', '')).strip()
+    if len(code) != 6 or any(c not in JOIN_CODE_CHARACTERS for c in code):
+        fail(422, 'INVALID_CODE', 'El código debe tener seis caracteres entre letras y números')
+    code = code.upper()
     db = database()
     doc = db.classes.find_one({'join_code': code, 'is_active': True, 'enrollment_open': True})
     if not doc:
         fail(404, 'CLASS_NOT_FOUND', 'Código no válido o inscripciones cerradas')
-    if user.get('career_id') and str(user['career_id']) != str(doc['career_id']):
-        fail(403, 'CAREER_MISMATCH', 'La clase pertenece a otra carrera')
+    ensure_student_class_scope(db, user, doc)
     now = datetime.now(timezone.utc)
     # Un alumno puede cursar distintas materias, pero no dos grupos de la misma
     # materia durante el mismo periodo.
-    for entry in db.class_memberships.find({'student_id': str(user['_id'])}):
-        existing = db.classes.find_one({'_id': entry['class_id']})
+    class_refs = id_refs(doc['_id'])
+    for entry in db.class_memberships.find({'student_id': {'$in': id_refs(user['_id'])}}):
+        existing_id = entry.get('class_id')
+        if existing_id in class_refs:
+            fail(409, 'ALREADY_ENROLLED', 'Ya estás inscrito en esta clase')
+        existing = db.classes.find_one({'_id': {'$in': id_refs(existing_id)}})
         if existing and str(existing.get('subject_id')) == str(doc['subject_id']) and str(existing.get('period_id')) == str(doc['period_id']):
-            if existing['_id'] == doc['_id']:
-                fail(409, 'ALREADY_ENROLLED', 'Ya estás inscrito en esta clase')
             fail(409, 'SUBJECT_ALREADY_ENROLLED', 'Ya estás inscrito en esta materia durante el periodo')
     membership = {'class_id': doc['_id'], 'student_id': str(user['_id'])}
     subject_period_key = f"{doc['subject_id']}:{doc['period_id']}"
-    if db.class_memberships.find_one(membership):
-        fail(409, 'ALREADY_ENROLLED', 'Ya estás inscrito en esta clase')
     try:
         result = db.class_memberships.update_one(membership, {'$setOnInsert': {
             **membership, 'subject_period_key': subject_period_key, 'joined_at': now}}, upsert=True)
@@ -260,14 +462,14 @@ def accept_invitation(invitation_id: str, user=Depends(get_current_user)):
         fail(404, 'NOT_FOUND', 'Invitación no encontrada')
     db.classes.update_one({'_id': invite['class_id']}, {'$addToSet': {'tutor_ids': str(user['_id'])}})
     db.class_tutor_invitations.update_one({'_id': invite['_id']}, {'$set': {'status': 'accepted', 'accepted_at': datetime.now(timezone.utc)}})
-    return {'success': True, 'data': {'message': 'Ahora puedes consultar los alumnos de la clase'}}
+    return {'success': True, 'data': {'message': 'Invitación aceptada'}}
 
 @router.patch('/{class_id}')
 def update_class(class_id: str, payload: dict, user=Depends(get_current_user)):
     if user['role'] not in MANAGERS:
         fail(403, 'FORBIDDEN', 'Sin permisos')
     db = database()
-    query = {'_id': oid(class_id, 'clase'), **scope(db, user)}
+    query = {'$and': [{'_id': oid(class_id, 'clase')}, scope(db, user)]}
     doc = db.classes.find_one(query)
     if not doc:
         fail(404, 'NOT_FOUND', 'Clase no encontrada')
@@ -278,10 +480,10 @@ def update_class(class_id: str, payload: dict, user=Depends(get_current_user)):
                 fail(422, 'INVALID_VALUE', f'{key} debe ser booleano')
             changes[key] = payload[key]
     if 'teacher_id' in payload:
-        changes['teacher_id'] = validate_relations(db, {**doc, 'teacher_id': payload['teacher_id']}, str(doc['career_id']))
+        changes['teacher_id'] = validate_relations(db, {**doc, 'teacher_id': payload['teacher_id']}, str(doc['career_id']), user)
     if payload.get('regenerate_code') is True:
         for _ in range(15):
-            code = ''.join(secrets.choice(ALPHABET) for _ in range(6))
+            code = generate_join_code()
             if not db.classes.find_one({'join_code': code}):
                 changes['join_code'] = code
                 break
@@ -303,24 +505,22 @@ def class_community(class_id: str, user=Depends(get_current_user)):
         fail(404, 'NOT_FOUND', 'Clase no encontrada')
     uid = str(user['_id'])
     if user['role'] == 'student':
-        if not db.class_memberships.find_one({'class_id': doc['_id'], 'student_id': uid}):
+        ensure_student_class_scope(db, user, doc)
+        if not db.class_memberships.find_one({'class_id': {'$in': id_refs(doc['_id'])},
+                                              'student_id': {'$in': id_refs(uid)}}):
             fail(403, 'FORBIDDEN', 'No perteneces a esta clase')
-    elif not db.classes.find_one({'_id': doc['_id'], **scope(db, user)}):
+    elif not db.classes.find_one({'$and': [{'_id': doc['_id']}, scope(db, user)]}):
         fail(403, 'FORBIDDEN', 'No puedes consultar esta clase')
-    members = list(db.class_memberships.find({'class_id': doc['_id']}, {'student_id': 1}))
+    members = db.class_memberships.find({'class_id': {'$in': id_refs(doc['_id'])}}, {'student_id': 1})
     ids = [ObjectId(str(m['student_id'])) for m in members if ObjectId.is_valid(str(m.get('student_id', '')))]
     students = [serialize(x) for x in db.users.find({'_id': {'$in': ids}}, {'full_name': 1, 'avatar': 1, 'banner_color': 1, 'bio': 1})]
     teacher = db.users.find_one({'_id': ObjectId(str(doc['teacher_id']))}, {'full_name': 1, 'avatar': 1, 'banner_color': 1, 'bio': 1}) if ObjectId.is_valid(str(doc.get('teacher_id', ''))) else None
-    tutors = []
-    refs = set(str(x) for x in doc.get('tutor_ids', []))
-    group = str(doc.get('group_id', ''))
-    for assignment in db.tutor_assignments.find({'group_id': group, 'is_active': {'$ne': False}}):
-        ref = str(assignment.get('tutor_id', ''))
-        if ObjectId.is_valid(ref):
-            profile = db.tutors.find_one({'_id': ObjectId(ref)})
-            refs.add(str(profile.get('user_id', ref)) if profile else ref)
-    tutor_ids = [ObjectId(x) for x in refs if ObjectId.is_valid(x)]
-    tutors = [serialize(x) for x in db.users.find({'_id': {'$in': tutor_ids}, 'role': 'tutor'}, {'full_name': 1, 'avatar': 1, 'banner_color': 1, 'bio': 1})]
+    tutor_ids = assigned_tutor_ids(db, doc, user.get('institution_id'))
+    tutors = [serialize(x) for x in db.users.find({
+        '_id': {'$in': tutor_ids}, 'is_active': {'$ne': False}, 'is_deleted': {'$ne': True},
+    }, {'full_name': 1, 'avatar': 1, 'banner_color': 1, 'bio': 1})]
+    if user['role'] == 'student':
+        students = [person for person in students if person['id'] != uid]
     return {'success': True, 'data': {'students': students, 'teacher': serialize(teacher) if teacher else None, 'tutors': tutors}}
 
 @router.post('/subjects', status_code=201)
@@ -339,6 +539,8 @@ def create_subject_for_class(payload: dict, user=Depends(get_current_user)):
         fail(409, 'SUBJECT_EXISTS', 'La materia ya existe en esta carrera; selecciónala en la lista')
     now = datetime.now(timezone.utc)
     data = {'name': name, 'career_id': career, 'code': str(payload.get('code') or ('MAT-' + secrets.token_hex(3).upper())), 'is_active': True, 'is_deleted': False, 'created_at': now, 'updated_at': now}
+    if user.get('institution_id'):
+        data['institution_id'] = user['institution_id']
     try:
         result = db.subjects.insert_one(data)
     except DuplicateKeyError:
@@ -352,20 +554,21 @@ def class_students(class_id: str, user=Depends(get_current_user)):
     """Complete class roster, restricted to actual class members and assigned staff."""
     db = database()
     class_oid = oid(class_id, 'clase')
-    doc = db.classes.find_one({'_id': class_oid}, {'_id': 1})
+    doc = db.classes.find_one({'_id': class_oid}, {'career_id': 1, 'institution_id': 1})
     if not doc:
         fail(404, 'CLASS_NOT_FOUND', 'Clase no encontrada')
     uid = str(user['_id'])
     # Historical membership documents may contain string or ObjectId identifiers.
     class_refs = [class_oid, str(class_oid)]
     if user['role'] == 'student':
+        ensure_student_class_scope(db, user, doc)
         member = db.class_memberships.find_one({
             'class_id': {'$in': class_refs},
-            'student_id': {'$in': [uid, user['_id']]}
+            'student_id': {'$in': id_refs(uid)}
         }, {'_id': 1})
         if not member:
             fail(403, 'FORBIDDEN', 'No perteneces a esta clase')
-    elif not db.classes.find_one({'_id': class_oid, **scope(db, user)}, {'_id': 1}):
+    elif not db.classes.find_one({'$and': [{'_id': class_oid}, scope(db, user)]}, {'_id': 1}):
         fail(403, 'FORBIDDEN', 'No puedes consultar esta clase')
     memberships = db.class_memberships.find({'class_id': {'$in': class_refs}}, {'student_id': 1})
     ids = list({ObjectId(str(m['student_id'])) for m in memberships
@@ -385,7 +588,7 @@ def class_students(class_id: str, user=Depends(get_current_user)):
 def invite_tutor(class_id: str, payload: dict, user=Depends(get_current_user)):
     """El docente invita a un tutor real de la carrera; no otorga acceso hasta aceptar."""
     db = database()
-    doc = db.classes.find_one({'_id': oid(class_id, 'clase')})
+    doc = db.classes.find_one({'$and': [{'_id': oid(class_id, 'clase')}, scope(db, user)]})
     if not doc or (user['role'] not in {'admin', 'super_admin', 'career_admin'} and str(doc.get('teacher_id')) != str(user['_id'])):
         fail(403, 'FORBIDDEN', 'Solo el docente responsable puede invitar tutores')
     tutor_user_id = str(payload.get('tutor_user_id', ''))

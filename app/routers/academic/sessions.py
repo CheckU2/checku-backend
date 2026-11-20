@@ -6,11 +6,12 @@ import io
 import qrcode
 import qrcode.image.svg
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from app.config import get_settings
 from app.database import get_database
 from app.dependencies import get_current_user
 from app.routers.academic.generic import serialize, audit
+from app.services.institutions import career_belongs_to_user_institution, institution_career_refs
 
 router=APIRouter(prefix="/sessions",tags=["Sesiones de clase y QR"])
 def qr_image(session_id, token):
@@ -28,9 +29,22 @@ def allowed_teacher(db,user,session):
     role=user.get("role")
     if role in {"super_admin","admin"}: return True
     if role=="career_admin": return session.get("career_id")==user.get("career_id")
-    return session.get("teacher_id")==str(user["_id"]) or session.get("teacher_id")==user["_id"]
+    owns_session=session.get("teacher_id")==str(user["_id"]) or session.get("teacher_id")==user["_id"]
+    if not owns_session:
+        return False
+    if role=="teacher" and user.get("institution_id"):
+        context = user.get("active_context") or {}
+        if context.get("scope_type") == "class" and str(session.get("class_id")) != context.get("scope_id"):
+            return False
+        career_id=session.get("career_id")
+        if not career_id and ObjectId.is_valid(str(session.get("class_id",""))):
+            linked_class=db.classes.find_one({"_id":ObjectId(str(session["class_id"]))},{"career_id":1})
+            career_id=(linked_class or {}).get("career_id")
+        return (not user.get("career_id") or str(career_id) == str(user["career_id"])) and career_belongs_to_user_institution(db,user,career_id)
+    return True
 def details(db, doc):
     row = serialize(doc)
+    row.pop("proximity_anchor", None)
     for field, collection, name in (("subject_id", "subjects", "subject_name"), ("group_id", "groups", "group_name"), ("period_id", "academic_periods", "period_name")):
         value = str(doc.get(field, ""))
         ref = db[collection].find_one({"_id": ObjectId(value)}) if ObjectId.is_valid(value) else None
@@ -38,10 +52,16 @@ def details(db, doc):
     return row
 
 def student_class_ids(db, user):
+    if user.get("institution_id"):
+        from app.routers.academic.classes import scope
+        return [str(row["_id"]) for row in db.classes.find(scope(db, user), {"_id": 1})]
     return [str(x["class_id"]) for x in db.class_memberships.find({"student_id":str(user["_id"])}, {"class_id":1})]
 
 def student_session_query(db, user):
     ids = student_class_ids(db, user)
+    if user.get("institution_id"):
+        from app.routers.academic.classes import id_refs
+        return {"class_id": {"$in": [ref for class_id in ids for ref in id_refs(class_id)]}}
     return {"class_id": {"$in": ids}} if ids else {"_id": {"$in": []}}
 
 def tutor_session_query(db, user):
@@ -50,6 +70,17 @@ def tutor_session_query(db, user):
     ids = [str(c["_id"]) for c in classes]
     return {"class_id": {"$in": ids}} if ids else {"_id": {"$in": []}}
 
+def teacher_session_query(db,user):
+    teacher_id=str(user["_id"])
+    query={"teacher_id":{"$in":[teacher_id,ObjectId(teacher_id)] if ObjectId.is_valid(teacher_id) else [teacher_id]}}
+    if user.get("institution_id"):
+        query["career_id"]={"$in":institution_career_refs(db,user)}
+        context = user.get("active_context") or {}
+        if context.get("scope_type") == "class":
+            from app.routers.academic.classes import id_refs
+            query["class_id"] = {"$in": id_refs(context.get("scope_id"))}
+    return query
+
 @router.post("",status_code=201)
 def create_session(payload:dict,user=Depends(get_current_user)):
     if user.get("role") not in {"teacher","career_admin","super_admin","admin"}: raise HTTPException(403,detail={"code":"FORBIDDEN","message":"Sin permisos"})
@@ -57,6 +88,12 @@ def create_session(payload:dict,user=Depends(get_current_user)):
     data={k:payload[k] for k in ("subject_id","group_id","period_id","career_id","schedule_id","starts_at") if k in payload}
     class_id = str(payload.get('class_id', ''))
     linked_class = db.classes.find_one({'_id': ObjectId(class_id), 'is_active': {'$ne': False}}) if ObjectId.is_valid(class_id) else None
+    if user.get("role")=="teacher" and user.get("institution_id") and (not linked_class or not career_belongs_to_user_institution(db,user,linked_class.get("career_id"))):
+        raise HTTPException(403,detail={"code":"TENANT_SCOPE_MISMATCH","message":"La clase no pertenece a tu institución"})
+    if user.get("role")=="teacher" and user.get("institution_id"):
+        from app.routers.academic.classes import scope
+        if not db.classes.find_one({"$and": [{"_id": linked_class["_id"]}, scope(db, user)]}, {"_id": 1}):
+            raise HTTPException(403, detail={"code":"CLASS_OUT_OF_SCOPE","message":"La clase está fuera de tu asignación docente"})
     if linked_class:
         if user.get('role') == 'teacher' and str(linked_class['teacher_id']) != str(user['_id']):
             raise HTTPException(403, detail={'message': 'Esta clase pertenece a otro docente'})
@@ -85,7 +122,7 @@ def create_session(payload:dict,user=Depends(get_current_user)):
 @router.get("")
 def list_sessions(page:int=Query(1,ge=1),limit:int=Query(20,ge=1,le=100),user=Depends(get_current_user)):
     db=db_or_503(); q={}
-    if user.get("role")=="teacher": q["teacher_id"]=str(user["_id"])
+    if user.get("role")=="teacher": q.update(teacher_session_query(db,user))
     elif user.get("role")=="career_admin": q["career_id"]=user.get("career_id")
     elif user.get("role")=="student": q.update(student_session_query(db, user))
     elif user.get("role")=="tutor": q.update(tutor_session_query(db, user))
@@ -96,7 +133,7 @@ def list_sessions(page:int=Query(1,ge=1),limit:int=Query(20,ge=1,le=100),user=De
 @router.get("/active")
 def active(user=Depends(get_current_user)):
     db=db_or_503(); q={"status":"active"}
-    if user.get("role")=="teacher": q["teacher_id"]=str(user["_id"])
+    if user.get("role")=="teacher": q.update(teacher_session_query(db,user))
     elif user.get("role")=="career_admin": q["career_id"]=user.get("career_id")
     elif user.get("role")=="student":
         q.update(student_session_query(db, user))
@@ -110,7 +147,7 @@ def get_session(session_id:str,user=Depends(get_current_user)):
     if not doc: raise HTTPException(404,detail={"code":"NOT_FOUND","message":"Sesión no encontrada"})
     if user.get("role")=="tutor" and str(doc.get("class_id")) not in tutor_session_query(db,user).get("class_id",{}).get("$in",[]): raise HTTPException(403,detail={"message":"No tienes asignada esta sesión"})
     if not allowed_teacher(db,user,doc) and user.get("role") not in {"student","tutor"}: raise HTTPException(403,detail={"code":"FORBIDDEN","message":"Sin permisos"})
-    if user.get("role")=="student" and str(doc.get("class_id")) not in student_class_ids(db, user): raise HTTPException(404,detail={"code":"NOT_FOUND","message":"Sesión no encontrada"})
+    if user.get("role")=="student" and not db.class_sessions.find_one({"$and": [{"_id": doc["_id"]}, student_session_query(db, user)]}, {"_id": 1}): raise HTTPException(404,detail={"code":"NOT_FOUND","message":"Sesión no encontrada"})
     return {"success":True,"data":serialize(doc)}
 @router.get('/{session_id}/report')
 def session_report(session_id: str, user=Depends(get_current_user)):
@@ -129,8 +166,10 @@ def session_report(session_id: str, user=Depends(get_current_user)):
             raise HTTPException(403, detail={'message': 'No tienes acceso a esta clase'})
     elif not allowed_teacher(db, user, session):
         raise HTTPException(403, detail={'message': 'No tienes acceso a esta sesión'})
+    from app.routers.academic.classes import id_refs
+    from app.services.attendance_analysis import attendance_records
     cid = str(session.get('class_id', ''))
-    memberships = list(db.class_memberships.find({'class_id': ObjectId(cid)}, {'student_id': 1, 'joined_at': 1})) if ObjectId.is_valid(cid) else []
+    memberships = list(db.class_memberships.find({'class_id': {'$in': id_refs(cid)}}, {'student_id': 1, 'joined_at': 1})) if ObjectId.is_valid(cid) else []
     # Para sesiones históricas, solo alumnos inscritos al momento de finalizar.
     ended = session.get('ended_at')
     if ended:
@@ -138,17 +177,17 @@ def session_report(session_id: str, user=Depends(get_current_user)):
     uids = [str(m['student_id']) for m in memberships]
     valid = [ObjectId(x) for x in uids if ObjectId.is_valid(x)]
     users = {str(u['_id']): u for u in db.users.find({'_id': {'$in': valid}}, {'full_name': 1, 'avatar_url': 1, 'profile_photo': 1})}
-    attendance = {str(a.get('student_id')): a for a in db.attendance.find({'session_id': session_id})}
+    attendance = attendance_records(db, [session_id], uids)
     entries = []
     for uid in uids:
-        a = attendance.get(uid)
+        a = attendance.get((session_id, uid))
         profile = users.get(uid, {})
         entries.append({'student_id': uid, 'full_name': profile.get('full_name', 'Alumno'), 'avatar_url': profile.get('avatar_url') or profile.get('profile_photo'), 'status': a.get('status', 'absent' if session.get('status') == 'closed' else 'pending') if a else ('absent' if session.get('status') == 'closed' else 'pending'), 'recorded_at': a.get('recorded_at') if a else None})
     counts = {key: sum(x['status'] == key for x in entries) for key in ('present','late','absent','excused','pending')}
     return {'success': True, 'data': {'session': details(db, session), 'students': entries, 'counts': counts, 'departure_tracking': False}}
 
 @router.post("/{session_id}/start")
-def start(session_id:str,user=Depends(get_current_user)):
+def start(session_id:str,user=Depends(get_current_user),payload:dict|None=Body(default=None)):
     if not ObjectId.is_valid(session_id): raise HTTPException(400,detail={"code":"INVALID_ID","message":"Identificador inválido"})
     db=db_or_503(); now=datetime.now(timezone.utc); doc=db.class_sessions.find_one({"_id":ObjectId(session_id)})
     if not doc: raise HTTPException(404,detail={"code":"NOT_FOUND","message":"Sesión no encontrada"})
@@ -158,7 +197,11 @@ def start(session_id:str,user=Depends(get_current_user)):
         linked = db.classes.find_one({'_id': ObjectId(doc['class_id']), 'teacher_id': str(user['_id'])}) if ObjectId.is_valid(str(doc.get('class_id', ''))) else None
         if not assigned and not linked: raise HTTPException(403,detail={"code":"NOT_ASSIGNED","message":"Ya no tienes asignada esta clase"})
     if doc.get("status")=="closed": raise HTTPException(409,detail={"code":"SESSION_CLOSED","message":"La clase ya está cerrada"})
-    db.class_sessions.update_one({"_id":doc["_id"],"status":{"$ne":"closed"}},{"$set":{"status":"active","started_at":doc.get("started_at",now),"updated_at":now}})
+    settings = {"status":"active","started_at":doc.get("started_at",now),"updated_at":now}
+    if isinstance(payload, dict) and "teacher_location" in payload:
+        from app.routers.academic.proximity import gps_settings
+        settings.update(gps_settings(payload["teacher_location"], now))
+    db.class_sessions.update_one({"_id":doc["_id"],"status":{"$ne":"closed"}},{"$set":settings})
     fresh=db.class_sessions.find_one({"_id":doc["_id"]})
     if not db.qr_challenges.find_one({"session_id":str(doc["_id"]),"revoked_at":None,"expires_at":{"$gt":now}}):
         raw=secrets.token_urlsafe(32); code=f"{secrets.randbelow(10000):04d}"
@@ -177,19 +220,30 @@ def end(session_id:str,user=Depends(get_current_user)):
         db.class_sessions.update_one({"_id":doc["_id"],"status":{"$ne":"closed"}},{"$set":{"status":"closed","ended_at":now,"updated_at":now}})
         db.qr_challenges.update_many({"session_id":session_id,"revoked_at":None},{"$set":{"revoked_at":now}})
         # Absences are inserted only for enrolled students without an attendance record.
-        members = db.class_memberships.find({"class_id":ObjectId(doc["class_id"])}) if ObjectId.is_valid(str(doc.get("class_id", ""))) else []
+        from app.routers.academic.attendance import attendance_for_student
+        from app.routers.academic.classes import id_refs
+        members = db.class_memberships.find({"class_id":{"$in":id_refs(doc["class_id"])}}) if ObjectId.is_valid(str(doc.get("class_id", ""))) else []
         for e in members:
             sid=str(e.get("student_id"))
+            if attendance_for_student(db, session_id, sid):
+                continue
             db.attendance.update_one({"session_id":session_id,"student_id":sid},{"$setOnInsert":{"session_id":session_id,"student_id":sid,"status":"absent","recorded_at":now,"created_by":"system"}},upsert=True)
         audit(db,user,"end","class_sessions",session_id)
     return {"success":True,"data":serialize(db.class_sessions.find_one({"_id":doc["_id"]}))}
 @router.post("/{session_id}/qr/rotate")
-def rotate_qr(session_id:str,user=Depends(get_current_user)):
+def rotate_qr(session_id:str,user=Depends(get_current_user),payload:dict|None=Body(default=None)):
     if not ObjectId.is_valid(session_id): raise HTTPException(400,detail={"code":"INVALID_ID","message":"Identificador inválido"})
     db=db_or_503(); doc=db.class_sessions.find_one({"_id":ObjectId(session_id)})
     if not doc or not allowed_teacher(db,user,doc): raise HTTPException(404,detail={"code":"NOT_FOUND","message":"Sesión no encontrada"})
     if doc.get("status")!="active": raise HTTPException(409,detail={"code":"SESSION_NOT_ACTIVE","message":"La clase no está activa"})
-    now=datetime.now(timezone.utc); db.qr_challenges.update_many({"session_id":session_id,"revoked_at":None},{"$set":{"revoked_at":now}})
+    now=datetime.now(timezone.utc)
+    if isinstance(payload, dict) and "teacher_location" in payload:
+        from app.routers.academic.proximity import gps_settings
+        settings = gps_settings(payload["teacher_location"], now)
+        updated = db.class_sessions.update_one({"_id":doc["_id"],"status":"active"},{"$set":settings})
+        if not updated.matched_count:
+            raise HTTPException(409,detail={"code":"SESSION_NOT_ACTIVE","message":"La clase no está activa"})
+    db.qr_challenges.update_many({"session_id":session_id,"revoked_at":None},{"$set":{"revoked_at":now}})
     raw=secrets.token_urlsafe(32); code=f"{secrets.randbelow(10000):04d}"
     import hashlib
     while db.qr_challenges.find_one({"code_hash":hashlib.sha256(code.encode()).hexdigest(),"revoked_at":None,"expires_at":{"$gt":now}}): code=f"{secrets.randbelow(10000):04d}"
