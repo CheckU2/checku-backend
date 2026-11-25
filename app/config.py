@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     smtp_username: str = ""
     smtp_password: str = ""
     smtp_from_email: str = ""
+    smtp_from_name: str = "CheckU"
     smtp_use_tls: bool = True
     public_registration_enabled: bool = True
     multi_institution_registration_enabled: bool = False

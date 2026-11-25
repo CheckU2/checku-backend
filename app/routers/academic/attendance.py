@@ -8,7 +8,7 @@ from app.dependencies import get_current_user
 from app.routers.academic.generic import serialize, audit
 from app.routers.academic.classes import id_refs, scope as class_scope
 from app.routers.academic.sessions import student_session_query
-from app.routers.academic.proximity import verify_checkin_location
+from app.routers.academic.proximity import bluetooth_proof_is_valid, verify_checkin_location
 router=APIRouter(prefix="/attendance",tags=["Asistencia"])
 def dbx():
  d=get_database()
@@ -55,7 +55,10 @@ def checkin(payload,user,field):
  if not valid:
   db.qr_challenges.update_one({"_id":ch["_id"]},{"$inc":{"attempts":1}})
   raise HTTPException(400,detail={"code":"INVALID_CHALLENGE","message":"Código inválido"})
- if session.get("gps_checkin_required"):
+ if session.get("bluetooth_checkin_required"):
+  if not session.get("proximity_enabled") or not bluetooth_proof_is_valid(session, user, payload.get("bluetooth_proof")):
+   raise HTTPException(403, detail={"message":"Acércate al teléfono del docente e intenta de nuevo con Bluetooth activado."})
+ elif session.get("gps_checkin_required"):
   verify_checkin_location(session, payload.get("location"))
  doc={"session_id":sid,"student_id":student_id,"user_id":user["_id"],"status":"present","recorded_at":now,"created_at":now,"source":"qr" if field=="qr_token" else "code"}
  try:
