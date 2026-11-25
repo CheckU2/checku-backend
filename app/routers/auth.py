@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
+from math import ceil
 import time, secrets, base64, re
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -16,13 +17,22 @@ from app.schemas.auth import (
     VerificationCodeRequest,
     VerifyEmailRequest,
 )
+from app.schemas.password_policy import password_policy_error
 from app.security import verify_password, create_access_token, hash_password, token_hash, opaque_token
-from app.services.users import create_user, public_user
+from app.services.users import public_user
 from app.services.email import send_password_reset_email
-from app.services.email_verification import send_verification_code, verify_email_code
+from app.services.email_verification import (
+    CODE_EXPIRY_MINUTES,
+    RESEND_COOLDOWN_SECONDS,
+    send_verification_code,
+    verify_email_code,
+)
 from app.services.email_change import confirm_email_change, request_email_change
 from app.services.password_change import confirm_password_change, request_password_change
-from app.services.institutions import institution, valid_timezone, now_utc
+from app.services.institutions import institution, valid_timezone
+from app.services.public_registration import (
+    complete_registration, confirm_registration, find_pending_registration, resend_registration_code, start_registration,
+)
 from app.services.authorization import apply_user_context, resolve_user_context, user_contexts
 
 router=APIRouter(prefix="/auth",tags=["Autenticación"])
@@ -42,81 +52,104 @@ def issue_tokens(db,user,context=None):
     access=create_access_token(str(user["_id"]),user["role"],context=context)
     return {"access_token":access,"refresh_token":refresh,"token_type":"bearer","expires_in":settings.access_token_expire_minutes*60}
 
+def context_display_name(db, context):
+    scope = context.get("scope_type")
+    identifier = context.get("scope_id")
+    institution_id = context.get("institution_id")
+    if scope not in {"group", "career", "class"} or not institution_id or not ObjectId.is_valid(identifier):
+        return None
+    collection = getattr(db, {"group": "groups", "career": "careers", "class": "classes"}[scope])
+    record = collection.find_one(
+        {"_id": ObjectId(identifier), "institution_id": institution_id, "is_deleted": {"$ne": True}},
+        {"name": 1, "subject_name": 1, "code": 1},
+    )
+    if not record:
+        return None
+    return record.get("name") or record.get("subject_name") or record.get("code")
+
+
 def auth_user_response(db,user,context=None):
     contexts=user_contexts(db,user)
     active_context=resolve_user_context(db,user,context) if context is not None else None
     response_user=apply_user_context(user,active_context) if active_context else user
     result=public_user(response_user)
-    result["contexts"]=contexts
+    result["contexts"] = [{**item, "scope_name": context_display_name(db, item)} for item in contexts]
     result["active_context"]=active_context
     return result
 
-@router.post("/register",status_code=201)
-def register(payload:RegisterRequest, request: Request):
-    s=get_settings()
-    rate_limit(request, "register", 10, 3600)
-    if not s.public_registration_enabled: raise HTTPException(403,detail={"code":"REGISTRATION_DISABLED","message":"El registro público está deshabilitado"})
-    if len(s.jwt_secret_key) < 32:
-        raise HTTPException(503, detail={"code": "AUTH_UNAVAILABLE", "message": "Registro temporalmente no disponible"})
-    try:
-        if payload.account_type not in ("student", "teacher"):
-            raise HTTPException(422,detail={"code":"INVALID_ACCOUNT_TYPE","message":"Tipo de cuenta inválido"})
-        db=get_database()
-        if db is None: raise RuntimeError("MongoDB no disponible")
-        if payload.institution_id:
-            inst=institution(db,payload.institution_id)
-            if not s.multi_institution_registration_enabled:
-                raise HTTPException(403,detail={"code":"FEATURE_DISABLED","message":"Registro multiinstitucional aún no habilitado"})
-            if payload.account_type == "student" and not payload.career_id:
-                raise HTTPException(422,detail={"code":"CAREER_REQUIRED","message":"Selecciona tu carrera"})
-            if payload.career_id:
-                if not ObjectId.is_valid(payload.career_id) or not db.careers.find_one({"_id":ObjectId(payload.career_id),"institution_id":payload.institution_id,"is_deleted":{"$ne":True}}):
-                    raise HTTPException(422,detail={"code":"INVALID_CAREER","message":"Carrera no pertenece a la institución"})
-        elif payload.career_id or payload.account_type=="teacher":
-            raise HTTPException(422,detail={"code":"INSTITUTION_REQUIRED","message":"Selecciona una institución"})
-        zone=valid_timezone(payload.timezone) if payload.timezone else None
-        # Teacher registration never grants teaching privileges without institutional approval.
-        user=create_user(email=str(payload.email),password=payload.password,role="student",full_name=payload.full_name,
-                         career_id=payload.career_id,institution_id=payload.institution_id,timezone_name=zone,
-                         require_email_verification=True)
-        if payload.institution_id:
-            db.users.update_one({"_id":user["_id"]},{"$set":{"account_type":payload.account_type}})
-            user["account_type"]=payload.account_type
-            membership_status="pending" if payload.account_type=="teacher" else "active"
-            db.institution_memberships.insert_one({"institution_id":payload.institution_id,"user_id":str(user["_id"]),
-                "status":membership_status,"joined_at":now_utc()})
-            if payload.account_type=="student":
-                db.role_assignments.update_one(
-                    {"institution_id":payload.institution_id,"user_id":str(user["_id"]),"role":"student","scope_type":"career","scope_id":payload.career_id},
-                    {"$set":{"status":"active","granted_at":now_utc()}},
-                    upsert=True,
-                )
-            else:
-                db.role_requests.insert_one({
-                    "user_id":str(user["_id"]),
-                    "institution_id":payload.institution_id,
-                    "requested_role":"teacher",
-                    "scope_type":"career" if payload.career_id else "institution",
-                    "scope_id":payload.career_id,
-                    "status":"pending",
-                    "created_at":now_utc(),
-                    "reviewed_by":None,
-                    "reviewed_at":None,
-                    "reason":None,
-                })
-    except ValueError as exc: raise HTTPException(409,detail={"code":"EMAIL_EXISTS","message":str(exc)})
-    except RuntimeError: raise HTTPException(503,detail={"code":"DATABASE_UNAVAILABLE","message":"Base de datos no disponible"})
-    except PyMongoError: raise HTTPException(503,detail={"code":"DATABASE_ERROR","message":"No fue posible guardar la cuenta"})
+def verification_timing(expires_at, sent_at):
+    now = datetime.now(timezone.utc)
 
+    def remaining(deadline):
+        if deadline is None:
+            return None
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        return max(0, ceil((deadline - now).total_seconds()))
+
+    return {
+        "expires_in_seconds": remaining(expires_at),
+        "resend_in_seconds": remaining(sent_at + timedelta(seconds=RESEND_COOLDOWN_SECONDS)) if sent_at else 0,
+    }
+
+
+def new_verification_timing(sent_at):
+    return verification_timing(sent_at + timedelta(minutes=CODE_EXPIRY_MINUTES), sent_at)
+
+
+def validate_registration_scope(db, settings, account_type, institution_id, career_id):
+    if account_type not in ("student", "teacher"):
+        raise HTTPException(422, detail={"code": "INVALID_ACCOUNT_TYPE", "message": "Tipo de cuenta inválido"})
+    if institution_id:
+        institution(db, institution_id)
+        if not settings.multi_institution_registration_enabled:
+            raise HTTPException(403, detail={"code": "FEATURE_DISABLED", "message": "Registro multiinstitucional aún no habilitado"})
+        if account_type == "student" and not career_id:
+            raise HTTPException(422, detail={"code": "CAREER_REQUIRED", "message": "Selecciona tu carrera"})
+        if career_id and (
+            not ObjectId.is_valid(career_id)
+            or not db.careers.find_one({"_id": ObjectId(career_id), "institution_id": institution_id, "is_deleted": {"$ne": True}})
+        ):
+            raise HTTPException(422, detail={"code": "INVALID_CAREER", "message": "Carrera no pertenece a la institución"})
+    elif career_id or account_type == "teacher":
+        raise HTTPException(422, detail={"code": "INSTITUTION_REQUIRED", "message": "Selecciona una institución"})
+
+
+@router.post("/register", status_code=202)
+def register(payload: RegisterRequest, request: Request):
+    settings = get_settings()
+    rate_limit(request, "register", 10, 3600)
+    if not settings.public_registration_enabled:
+        raise HTTPException(403, detail={"code": "REGISTRATION_DISABLED", "message": "El registro público está deshabilitado"})
+    if len(settings.jwt_secret_key) < 32:
+        raise HTTPException(503, detail={"code": "AUTH_UNAVAILABLE", "message": "Registro temporalmente no disponible"})
+    db = get_database()
+    if db is None:
+        raise HTTPException(503, detail={"code": "DATABASE_UNAVAILABLE", "message": "Base de datos no disponible"})
+    email = str(payload.email).lower().strip()
     try:
-        sent = send_verification_code(db, user["email"])
+        validate_registration_scope(db, settings, payload.account_type, payload.institution_id, payload.career_id)
+        if db.users.find_one({"email": email}, {"_id": 1}):
+            raise HTTPException(409, detail={"code": "EMAIL_EXISTS", "message": "Ya existe un usuario con ese correo"})
+        zone = valid_timezone(payload.timezone) if payload.timezone else None
+        result = start_registration(
+            db, email, full_name=payload.full_name, password=payload.password, account_type=payload.account_type,
+            institution_id=payload.institution_id, career_id=payload.career_id, timezone_name=zone,
+        )
     except PyMongoError:
-        sent = False
+        raise HTTPException(503, detail={"code": "DATABASE_ERROR", "message": "No se pudo guardar la solicitud de registro"})
+    if result is None:
+        raise HTTPException(429, detail={"code": "REGISTRATION_PENDING", "message": "Ya hay un registro pendiente. Usa el código anterior o espera un minuto para volver a solicitarlo."})
+    sent, challenge = result
     return {
         "success": True,
-        "data": {**public_user(user), "email_verification_required": True, "verification_email_sent": sent},
-        "message": "Cuenta creada. Confirma tu correo para iniciar sesión.",
+        "data": {
+            "email": email, "email_verification_required": True, "verification_email_sent": sent,
+            **verification_timing(challenge["expires_at"] if sent else None, challenge["sent_at"]),
+        },
+        "message": "Confirma tu correo para crear tu cuenta.",
     }
+
 
 @router.post("/verify-email")
 def verify_email(payload: VerifyEmailRequest, request: Request):
@@ -124,11 +157,22 @@ def verify_email(payload: VerifyEmailRequest, request: Request):
     db = get_database()
     if db is None:
         raise HTTPException(503, detail={"code": "DATABASE_UNAVAILABLE", "message": "Base de datos no disponible"})
-    if not verify_email_code(db, str(payload.email).lower().strip(), payload.code):
-        raise HTTPException(400, detail={
-            "code": "INVALID_VERIFICATION_CODE",
-            "message": "Código inválido, vencido o sin intentos disponibles.",
-        })
+    email = str(payload.email).lower().strip()
+    settings = get_settings()
+
+    def validate_scope(details):
+        if not settings.public_registration_enabled:
+            raise HTTPException(403, detail={"code": "REGISTRATION_DISABLED", "message": "El registro público está deshabilitado"})
+        validate_registration_scope(db, settings, details["account_type"], details.get("institution_id"), details.get("career_id"))
+
+    try:
+        verified = confirm_registration(db, email, payload.code, validate_scope) or verify_email_code(db, email, payload.code)
+    except DuplicateKeyError:
+        raise HTTPException(409, detail={"code": "EMAIL_EXISTS", "message": "Ya existe un usuario con ese correo"})
+    except PyMongoError:
+        raise HTTPException(503, detail={"code": "DATABASE_ERROR", "message": "No se pudo completar el registro. Intenta de nuevo."})
+    if not verified:
+        raise HTTPException(400, detail={"code": "INVALID_VERIFICATION_CODE", "message": "Código inválido, vencido o sin intentos disponibles."})
     return {"success": True, "data": {"message": "Correo confirmado. Ya puedes iniciar sesión."}}
 
 
@@ -138,7 +182,9 @@ def resend_verification(payload: ResendVerificationRequest, request: Request):
     db = get_database()
     if db is None:
         raise HTTPException(503, detail={"code": "DATABASE_UNAVAILABLE", "message": "Base de datos no disponible"})
-    send_verification_code(db, str(payload.email).lower().strip())
+    email = str(payload.email).lower().strip()
+    if not get_settings().public_registration_enabled or not resend_registration_code(db, email):
+        send_verification_code(db, email)
     return {"success": True, "data": {"message": "Si puedes verificar tu cuenta, recibirás un código."}}
 
 
@@ -147,13 +193,33 @@ def login(payload:LoginRequest,request:Request):
     rate_limit(request,"login",8,60)
     db=get_database()
     if db is None: raise HTTPException(503,detail={"code":"DATABASE_UNAVAILABLE","message":"Base de datos no disponible"})
-    user=db.users.find_one({"email":str(payload.email).lower().strip()})
+    email = str(payload.email).lower().strip()
+    user = db.users.find_one({"email": email})
+    if user and user.get("registration_pending") and verify_password(payload.password, user["password_hash"]):
+        validate_registration_scope(db, get_settings(), user["account_type"], user.get("institution_id"), user.get("career_id"))
+        try:
+            complete_registration(db, user)
+        except PyMongoError:
+            raise HTTPException(503, detail={"code": "DATABASE_ERROR", "message": "No se pudo completar el registro. Intenta de nuevo."})
+        user = db.users.find_one({"_id": user["_id"], "email": email})
+    if user is None:
+        pending = find_pending_registration(db, email)
+        if pending and verify_password(payload.password, pending["payload"]["password_hash"]):
+            challenge = pending["challenge"]
+            expires_at = pending["expires_at"] if pending.get("verified_at") else challenge["expires_at"]
+            raise HTTPException(403, detail={
+                "code": "EMAIL_NOT_VERIFIED",
+                "message": "Confirma tu correo para completar el registro.",
+                **verification_timing(expires_at, challenge["sent_at"]),
+            })
     if not user or not user.get("is_active",False) or not verify_password(payload.password,user.get("password_hash","")):
         raise HTTPException(401,detail={"code":"INVALID_CREDENTIALS","message":"Correo o contraseña incorrectos"})
     if "email_verified_at" in user and user["email_verified_at"] is None:
+        challenge = user.get("email_verification") or {}
         raise HTTPException(403, detail={
             "code": "EMAIL_NOT_VERIFIED",
             "message": "Confirma tu correo para iniciar sesión.",
+            **verification_timing(challenge.get("expires_at"), challenge.get("sent_at")),
         })
     contexts=user_contexts(db,user)
     context=contexts[0] if len(contexts)==1 else None
@@ -239,8 +305,9 @@ def forgot_password(payload:dict,request:Request):
 @router.post("/reset-password")
 def reset_password(payload:dict):
     raw=payload.get("token",""); password=payload.get("new_password","")
-    if not isinstance(password,str) or len(password)<12 or len(password)>128:
-        raise HTTPException(422,detail={"code":"INVALID_PASSWORD","message":"La contraseña debe tener entre 12 y 128 caracteres"})
+    password_error = password_policy_error(password)
+    if password_error:
+        raise HTTPException(422, detail={"code": "INVALID_PASSWORD", "message": password_error})
     db=get_database()
     if db is None: raise HTTPException(503,detail={"code":"DATABASE_UNAVAILABLE","message":"Base de datos no disponible"})
     now=datetime.now(timezone.utc); item=db.password_reset_tokens.find_one({"token_hash":token_hash(str(raw)),"used_at":None,"expires_at":{"$gt":now}})
@@ -268,12 +335,13 @@ def change_password(payload: ChangePasswordRequest, request: Request, user=Depen
     db = get_database()
     if db is None:
         raise HTTPException(503, detail={"code": "DATABASE_UNAVAILABLE", "message": "Base de datos no disponible"})
+    sent_at = datetime.now(timezone.utc)
     result = request_password_change(db, user, payload.new_password)
     if result == "delivery_failed":
         raise HTTPException(503, detail={"code": "VERIFICATION_EMAIL_FAILED", "message": "No se pudo enviar el código. Inténtalo de nuevo."})
     if result == "unavailable":
         raise HTTPException(429, detail={"code": "PASSWORD_CHANGE_UNAVAILABLE", "message": "Espera 60 segundos antes de solicitar otro código."})
-    return {"success": True, "data": {"verification_required": True, "message": "Enviamos un código al correo de tu cuenta."}}
+    return {"success": True, "data": {"verification_required": True, "message": "Enviamos un código al correo de tu cuenta.", **new_verification_timing(sent_at)}}
 
 
 @router.post("/change-password/confirm")
@@ -303,12 +371,13 @@ def change_email(payload: ChangeEmailRequest, request: Request, user=Depends(get
         raise HTTPException(503, detail={"message": "Base de datos no disponible."})
     if db.users.find_one({"email": email, "_id": {"$ne": user["_id"]}}, {"_id": 1}):
         raise HTTPException(409, detail={"message": "Ya existe una cuenta con ese correo."})
+    sent_at = datetime.now(timezone.utc)
     result = request_email_change(db, user, email)
     if result == "unavailable":
         raise HTTPException(429, detail={"message": "Espera 60 segundos antes de solicitar otro código."})
     if result == "delivery_failed":
         raise HTTPException(503, detail={"message": "No se pudo enviar el código. Inténtalo de nuevo."})
-    return {"success": True, "data": {"email": email, "message": "Enviamos un código al correo indicado."}}
+    return {"success": True, "data": {"email": email, "message": "Enviamos un código al correo indicado.", **new_verification_timing(sent_at)}}
 
 
 @router.post("/email-change/confirm")

@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     smtp_from_email: str = ""
     smtp_from_name: str = "CheckU"
     smtp_use_tls: bool = True
+    brevo_api_key: str = ""
     public_registration_enabled: bool = True
     multi_institution_registration_enabled: bool = False
     qr_challenge_ttl_seconds: int = 60

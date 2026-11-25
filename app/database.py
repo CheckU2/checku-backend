@@ -50,6 +50,7 @@ def ping_database() -> bool:
 
 def ensure_indexes(db) -> None:
     db.users.create_index("email", unique=True)
+    db.pending_registrations.create_index("expires_at", expireAfterSeconds=0)
     db.institutions.create_index("slug",unique=True)
     db.institution_memberships.create_index([("institution_id",1),("user_id",1)],unique=True)
     db.role_assignments.create_index([("institution_id",1),("user_id",1),("role",1),("scope_type",1),("scope_id",1)],unique=True)

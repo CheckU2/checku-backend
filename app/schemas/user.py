@@ -1,10 +1,11 @@
 from datetime import datetime
 from typing import Literal
 from pydantic import BaseModel,EmailStr,Field
+from app.schemas.password_policy import NewPassword
 Role=Literal["super_admin","career_admin","teacher","student","tutor"]
 class UserCreate(BaseModel):
  email:EmailStr
- password:str=Field(min_length=12,max_length=128)
+ password: NewPassword
  role:Literal["career_admin","teacher","student","tutor"]
  full_name:str=Field(min_length=2,max_length=120)
  career_id:str|None=None

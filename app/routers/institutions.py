@@ -8,6 +8,7 @@ from app.database import get_database
 from app.dependencies import get_current_user
 from app.services.institutions import institution, public_institution, check_platform, is_institution_admin, now_utc
 from app.services.authorization import canonical_role
+from app.schemas.password_policy import password_policy_error
 from app.services.users import create_user, public_user
 
 router=APIRouter(tags=["Instituciones"])
@@ -164,8 +165,9 @@ def assign_institution_owner(institution_id:str,payload:dict,user=Depends(get_cu
         name=payload.get('full_name'); password=payload.get('password')
         if not isinstance(name,str) or not 2<=len(name.strip())<=120:
             raise HTTPException(422,detail={'code':'INVALID_NAME','message':'Escribe el nombre del propietario'})
-        if not isinstance(password,str) or not 12<=len(password)<=128:
-            raise HTTPException(422,detail={'code':'INVALID_PASSWORD','message':'La contraseña debe tener entre 12 y 128 caracteres'})
+        password_error = password_policy_error(password)
+        if password_error:
+            raise HTTPException(422, detail={'code':'INVALID_PASSWORD','message':password_error})
         try:
             account=create_user(email=email,password=password,role='student',full_name=name.strip())
         except ValueError as exc:

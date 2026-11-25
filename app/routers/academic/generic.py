@@ -155,6 +155,8 @@ def serialize(doc):
     out={}
     for k,v in doc.items():
         if k.startswith("_") and k!="_id": continue
+        if isinstance(v, datetime) and v.tzinfo is None:
+            v = v.replace(tzinfo=timezone.utc)
         out["id" if k=="_id" else k]=str(v) if isinstance(v,ObjectId) else v
     return out
 def audit(db,user,action,entity,entity_id):

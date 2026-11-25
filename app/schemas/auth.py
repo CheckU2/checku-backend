@@ -1,11 +1,13 @@
 
 from pydantic import BaseModel, EmailStr, Field
 
+from app.schemas.password_policy import NewPassword
+
 
 class RegisterRequest(BaseModel):
     full_name: str = Field(min_length=2, max_length=120)
     email: EmailStr
-    password: str = Field(min_length=12, max_length=128)
+    password: NewPassword
     institution_id: str | None = None
     account_type: str = "student"
     career_id: str | None = None
@@ -31,7 +33,7 @@ class VerifyEmailRequest(ResendVerificationRequest, VerificationCodeRequest):
 
 class ChangePasswordRequest(BaseModel):
     current_password: str = Field(min_length=1, max_length=128)
-    new_password: str = Field(min_length=12, max_length=128)
+    new_password: NewPassword
 
 
 class ChangeEmailRequest(BaseModel):

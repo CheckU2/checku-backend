@@ -37,6 +37,8 @@ Copia el resultado en `JWT_SECRET_KEY`. No uses la clave de ejemplo ni subas `.e
 ## Correo SMTP
 Configura `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL` y `SMTP_USE_TLS`. `PASSWORD_RESET_BASE_URL` debe apuntar a la pantalla de restablecimiento del frontend. Para probar el envío, usa una cuenta de correo de desarrollo.
 
+En Render Free, verifica un remitente en Brevo y guarda `BREVO_API_KEY`, `SMTP_FROM_EMAIL` (el remitente verificado) y `SMTP_FROM_NAME` en la sección **Environment** del servicio. Vuelve a desplegar el backend. Con `BREVO_API_KEY` configurada, CheckU envía los correos por HTTPS. Si la clave está vacía, usa SMTP.
+
 ### Cambio de contraseña con sesión iniciada
 
 1. Envía `PATCH /api/v1/auth/change-password` con `current_password` y `new_password`. La API devuelve `202` al enviar el código al correo de la cuenta.
@@ -45,7 +47,7 @@ Configura `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM
 
 ### Verificación de correo
 
-- `POST /api/v1/auth/register` deja pendiente el correo y envía un código. La respuesta incluye `data.email_verification_required` y `data.verification_email_sent`. Si el envío falla, la cuenta queda creada y se puede solicitar un reenvío.
+- `POST /api/v1/auth/register` responde `202`, guarda la solicitud temporal durante 24 horas y envía un código. La cuenta y sus asignaciones se crean al confirmar el código. Si el envío falla, la solicitud permite pedir un reenvío. Las solicitudes abandonadas se eliminan mediante el índice TTL de MongoDB.
 - `POST /api/v1/auth/verify-email` recibe `{"email":"persona@example.com","code":"012345"}`. Envía el código como texto para conservar los ceros iniciales. Vence en 10 minutos, admite hasta cinco intentos y se consume al confirmar. Los códigos inválidos, vencidos o agotados devuelven `400 INVALID_VERIFICATION_CODE`.
 - `POST /api/v1/auth/resend-verification` recibe `{"email":"persona@example.com"}`. Devuelve un mensaje genérico. Se puede generar otro código cada 60 segundos por cuenta, sujeto también al límite por IP. Al generar uno nuevo, el anterior queda invalidado.
 - `POST /api/v1/auth/login` devuelve `403 EMAIL_NOT_VERIFIED` si la contraseña es correcta y el correo está pendiente. Las cuentas existentes y las creadas por administradores siguen su flujo habitual.

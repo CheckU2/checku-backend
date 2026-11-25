@@ -167,6 +167,7 @@ def session_report(session_id: str, user=Depends(get_current_user)):
     elif not allowed_teacher(db, user, session):
         raise HTTPException(403, detail={'message': 'No tienes acceso a esta sesión'})
     from app.routers.academic.classes import id_refs
+    from app.routers.academic.attendance import as_utc
     from app.services.attendance_analysis import attendance_records
     cid = str(session.get('class_id', ''))
     memberships = list(db.class_memberships.find({'class_id': {'$in': id_refs(cid)}}, {'student_id': 1, 'joined_at': 1})) if ObjectId.is_valid(cid) else []
@@ -182,7 +183,8 @@ def session_report(session_id: str, user=Depends(get_current_user)):
     for uid in uids:
         a = attendance.get((session_id, uid))
         profile = users.get(uid, {})
-        entries.append({'student_id': uid, 'full_name': profile.get('full_name', 'Alumno'), 'avatar_url': profile.get('avatar_url') or profile.get('profile_photo'), 'status': a.get('status', 'absent' if session.get('status') == 'closed' else 'pending') if a else ('absent' if session.get('status') == 'closed' else 'pending'), 'recorded_at': a.get('recorded_at') if a else None})
+        recorded_at = a.get('recorded_at') if a else None
+        entries.append({'student_id': uid, 'full_name': profile.get('full_name', 'Alumno'), 'avatar_url': profile.get('avatar_url') or profile.get('profile_photo'), 'status': a.get('status', 'absent' if session.get('status') == 'closed' else 'pending') if a else ('absent' if session.get('status') == 'closed' else 'pending'), 'recorded_at': as_utc(recorded_at) if isinstance(recorded_at, datetime) else recorded_at})
     counts = {key: sum(x['status'] == key for x in entries) for key in ('present','late','absent','excused','pending')}
     return {'success': True, 'data': {'session': details(db, session), 'students': entries, 'counts': counts, 'departure_tracking': False}}
 
