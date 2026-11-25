@@ -37,6 +37,8 @@ Copia el resultado en `JWT_SECRET_KEY`. No uses la clave de ejemplo ni subas `.e
 ## Correo SMTP
 Configura `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL` y `SMTP_USE_TLS`. `PASSWORD_RESET_BASE_URL` debe apuntar a la pantalla de restablecimiento del frontend. Para probar el envío, usa una cuenta de correo de desarrollo.
 
+En Render Free, verifica un remitente en Brevo y guarda `BREVO_API_KEY`, `SMTP_FROM_EMAIL` (el remitente verificado) y `SMTP_FROM_NAME` en la sección **Environment** del servicio. Vuelve a desplegar el backend. Con `BREVO_API_KEY` configurada, CheckU envía los correos por HTTPS. Si la clave está vacía, usa SMTP.
+
 ### Cambio de contraseña con sesión iniciada
 
 1. Envía `PATCH /api/v1/auth/change-password` con `current_password` y `new_password`. La API devuelve `202` al enviar el código al correo de la cuenta.
