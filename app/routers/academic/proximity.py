@@ -1,6 +1,8 @@
 """Referencia GPS del docente y eventos de permanencia durante la sesión."""
 from datetime import datetime, timezone
 from uuid import uuid4
+from hmac import compare_digest, digest
+from secrets import token_hex
 from math import asin, cos, isfinite, radians, sin
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,6 +13,7 @@ from app.routers.academic.sessions import student_session_query, teacher_session
 
 router = APIRouter(prefix='/proximity', tags=['Proximidad'])
 RADIUS_M = 50.0
+TEACHER_MAX_ACCURACY_M = 35
 GRACE_SECONDS = 120
 
 def dbx():
@@ -62,10 +65,57 @@ def distance_from_anchor(anchor, position):
     accuracy = number(position, 'accuracy_m', 0, 100000)
     anchor_lat = radians(number(anchor, 'latitude', -90, 90))
     anchor_lon = radians(number(anchor, 'longitude', -180, 180))
-    anchor_accuracy = number(anchor, 'accuracy_m', 0, 25)
+    anchor_accuracy = number(anchor, 'accuracy_m', 0, TEACHER_MAX_ACCURACY_M)
     h = sin((lat - anchor_lat) / 2)**2 + cos(lat) * cos(anchor_lat) * sin((lon - anchor_lon) / 2)**2
     distance = 6371000 * 2 * asin(min(1, h**0.5))
     return distance, accuracy + anchor_accuracy
+
+
+def bluetooth_settings():
+    return {
+        'bluetooth_checkin_required': True,
+        'proximity_ble_uuid': str(uuid4()),
+        '_proximity_bluetooth_key': token_hex(32),
+        'proximity_enabled': True,
+        'gps_checkin_required': False,
+    }
+
+
+def bluetooth_challenge(doc, user, time_slot):
+    key = bytes.fromhex(doc['_proximity_bluetooth_key'])
+    message = f"checku-challenge:{doc['_id']}:{user['_id']}:{time_slot}".encode()
+    return digest(key, message, 'sha256')[:16]
+
+
+def bluetooth_slot():
+    return int(datetime.now(timezone.utc).timestamp()) // 30
+
+
+def bluetooth_proof_is_valid(doc, user, proof):
+    if not isinstance(proof, str) or len(proof) != 32 or not doc.get('_proximity_bluetooth_key'):
+        return False
+    key = bytes.fromhex(doc['_proximity_bluetooth_key'])
+    slot = bluetooth_slot()
+    for time_slot in (slot, slot - 1):
+        challenge = bluetooth_challenge(doc, user, time_slot)
+        expected = digest(key, challenge, 'sha256')[:16].hex()
+        if compare_digest(expected.encode(), proof.encode()):
+            return True
+    return False
+
+
+@router.get('/sessions/{session_id}/ble/challenge')
+def issue_bluetooth_challenge(session_id: str, user=Depends(get_current_user)):
+    db = dbx()
+    doc = session(db, session_id)
+    if not student_allowed(db, doc, user):
+        raise HTTPException(403, detail={'message': 'Se requiere inscripción en esta clase.'})
+    if doc.get('status') != 'active' or not doc.get('bluetooth_checkin_required') or not doc.get('proximity_enabled'):
+        raise HTTPException(409, detail={'message': 'La sesión Bluetooth no está activa.'})
+    return {'success': True, 'data': {
+        'service': doc['proximity_ble_uuid'],
+        'challenge': bluetooth_challenge(doc, user, bluetooth_slot()).hex(),
+    }}
 
 
 def gps_settings(position, now):
@@ -74,7 +124,7 @@ def gps_settings(position, now):
     anchor = {
         'latitude': number(position, 'latitude', -90, 90),
         'longitude': number(position, 'longitude', -180, 180),
-        'accuracy_m': number(position, 'accuracy_m', 0, 25),
+        'accuracy_m': number(position, 'accuracy_m', 0, TEACHER_MAX_ACCURACY_M),
         'recorded_at': now,
         'source': 'teacher_phone_gps',
     }
@@ -115,7 +165,9 @@ def event(session_id: str, payload: dict, user=Depends(get_current_user)):
     if doc.get('status') != 'active' or not doc.get('proximity_enabled') or not (doc.get('proximity_anchor') or doc.get('proximity_ble_uuid')):
         raise HTTPException(409, detail={'message': 'Proximidad no disponible'})
     kind = payload.get('kind')
-    if doc.get('gps_checkin_required'):
+    if doc.get('bluetooth_checkin_required'):
+        kind = 'inside' if bluetooth_proof_is_valid(doc, user, payload.get('bluetooth_proof')) else 'uncertain'
+    elif doc.get('gps_checkin_required'):
         position = payload.get('location')
         if isinstance(position, dict):
             distance, uncertainty = distance_from_anchor(doc['proximity_anchor'], position)

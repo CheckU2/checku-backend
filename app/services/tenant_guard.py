@@ -5,6 +5,7 @@ from app.dependencies import get_current_user
 from app.services.academic_catalogs import CATALOG_PATHS, INSTITUTION_ADMINS
 
 STUDENT_ROUTES = {
+    ("GET", "/proximity/sessions/{session_id}/ble/challenge"),
     ("GET", "/sessions/active"),
     ("GET", "/sessions/{session_id}"),
     ("POST", "/proximity/sessions/{session_id}/events"),

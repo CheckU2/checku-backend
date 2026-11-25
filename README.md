@@ -7,7 +7,7 @@ API REST para seguimiento de asistencia académica con Python, FastAPI y MongoDB
 ## Requisitos
 - Python 3.11+ (recomendado 3.12/3.13).
 - MongoDB Atlas o MongoDB compatible.
-- Credenciales SMTP reales para recuperación por correo.
+- Credenciales SMTP reales para verificación de correo y recuperación de contraseña.
 - PowerShell en Windows.
 
 ## Instalación (PowerShell)
@@ -35,7 +35,20 @@ Copia el resultado en `JWT_SECRET_KEY`. No uses la clave de ejemplo ni subas `.e
 6. En producción habilita TLS, copias de seguridad, alertas y pruebas periódicas de restauración.
 
 ## Correo SMTP
-Configura `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL` y `SMTP_USE_TLS`. `PASSWORD_RESET_BASE_URL` debe apuntar a la pantalla de restablecimiento del frontend. La API no simula el envío: si SMTP no está configurado, devuelve un error genérico de servicio y no revela el token. Prueba primero con una cuenta de correo de desarrollo.
+Configura `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL` y `SMTP_USE_TLS`. `PASSWORD_RESET_BASE_URL` debe apuntar a la pantalla de restablecimiento del frontend. Para probar el envío, usa una cuenta de correo de desarrollo.
+
+### Cambio de contraseña con sesión iniciada
+
+1. Envía `PATCH /api/v1/auth/change-password` con `current_password` y `new_password`. La API devuelve `202` al enviar el código al correo de la cuenta.
+2. Envía `POST /api/v1/auth/change-password/confirm` con `{"code":"012345"}`. Ambas solicitudes requieren el token de acceso de la cuenta. El código vence en 10 minutos y admite cinco intentos.
+3. Para pedir otro código, repite el primer paso después de 60 segundos. Al confirmar, el backend aplica la nueva contraseña y revoca las sesiones renovables.
+
+### Verificación de correo
+
+- `POST /api/v1/auth/register` deja pendiente el correo y envía un código. La respuesta incluye `data.email_verification_required` y `data.verification_email_sent`. Si el envío falla, la cuenta queda creada y se puede solicitar un reenvío.
+- `POST /api/v1/auth/verify-email` recibe `{"email":"persona@example.com","code":"012345"}`. Envía el código como texto para conservar los ceros iniciales. Vence en 10 minutos, admite hasta cinco intentos y se consume al confirmar. Los códigos inválidos, vencidos o agotados devuelven `400 INVALID_VERIFICATION_CODE`.
+- `POST /api/v1/auth/resend-verification` recibe `{"email":"persona@example.com"}`. Devuelve un mensaje genérico. Se puede generar otro código cada 60 segundos por cuenta, sujeto también al límite por IP. Al generar uno nuevo, el anterior queda invalidado.
+- `POST /api/v1/auth/login` devuelve `403 EMAIL_NOT_VERIFIED` si la contraseña es correcta y el correo está pendiente. Las cuentas existentes y las creadas por administradores siguen su flujo habitual.
 
 ## Crear el superadministrador inicial
 Configura temporalmente `BOOTSTRAP_ADMIN_EMAIL` y `BOOTSTRAP_ADMIN_PASSWORD` antes del primer arranque. Se crea como `super_admin` si el correo no existe. Usa una contraseña fuerte, protege `.env` y retira estas variables tras el bootstrap. No existe registro público de superadministradores. El superadministrador pertenece a la plataforma CheckU; no es una cuenta institucional.
@@ -69,7 +82,7 @@ La prueba de `/ready` debe devolver 503 si Atlas no está configurado o no respo
 - Reportes básicos, auditoría y avatares privados con validación de imagen y re-encode para eliminar metadatos.
 
 ## Rutas principales
-- `/api/v1/auth`: register, login, refresh, logout, logout-all, me, forgot-password, reset-password, change-password.
+- `/api/v1/auth`: register, verify-email, resend-verification, login, refresh, logout, logout-all, me, forgot-password, reset-password, change-password, change-password/confirm.
 - `/api/v1/institutions`: catálogo público, alta por plataforma, propietario, miembros, alcances, solicitudes de rol, asignación y configuración institucional.
 - `/api/v1/users`: CRUD limitado, estado, baja lógica y avatar propio.
 - `/api/v1/careers`, `/academic-periods`, `/groups`, `/subjects`, `/students`, `/teachers`, `/tutors`, `/enrollments`, `/assignments`, `/schedules`, `/incidents`.

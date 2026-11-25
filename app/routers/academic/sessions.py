@@ -198,9 +198,14 @@ def start(session_id:str,user=Depends(get_current_user),payload:dict|None=Body(d
         if not assigned and not linked: raise HTTPException(403,detail={"code":"NOT_ASSIGNED","message":"Ya no tienes asignada esta clase"})
     if doc.get("status")=="closed": raise HTTPException(409,detail={"code":"SESSION_CLOSED","message":"La clase ya está cerrada"})
     settings = {"status":"active","started_at":doc.get("started_at",now),"updated_at":now}
-    if isinstance(payload, dict) and "teacher_location" in payload:
+    if isinstance(payload, dict) and payload.get("proximity_mode") == "bluetooth":
+        if user.get("role") != "teacher":
+            raise HTTPException(403, detail={"message":"Solo el docente de la sesión puede emitir por Bluetooth."})
+        from app.routers.academic.proximity import bluetooth_settings
+        settings.update(bluetooth_settings())
+    elif isinstance(payload, dict) and "teacher_location" in payload:
         from app.routers.academic.proximity import gps_settings
-        settings.update(gps_settings(payload["teacher_location"], now))
+        settings.update(gps_settings(payload["teacher_location"], now), bluetooth_checkin_required=False)
     db.class_sessions.update_one({"_id":doc["_id"],"status":{"$ne":"closed"}},{"$set":settings})
     fresh=db.class_sessions.find_one({"_id":doc["_id"]})
     if not db.qr_challenges.find_one({"session_id":str(doc["_id"]),"revoked_at":None,"expires_at":{"$gt":now}}):
@@ -209,7 +214,12 @@ def start(session_id:str,user=Depends(get_current_user),payload:dict|None=Body(d
         db.qr_challenges.insert_one({"session_id":str(doc["_id"]),"token_hash":__import__("hashlib").sha256(raw.encode()).hexdigest(),"code_hash":__import__("hashlib").sha256(code.encode()).hexdigest(),"code_last4":code[-2:],"created_at":now,"expires_at":now+timedelta(seconds=get_settings().qr_challenge_ttl_seconds),"revoked_at":None,"attempts":0})
         fresh["qr"]={"token":raw,"code":code,"expires_at":now+timedelta(seconds=get_settings().qr_challenge_ttl_seconds),"image":qr_image(str(doc["_id"]), raw)}
     audit(db,user,"start","class_sessions",session_id)
-    return {"success":True,"data":serialize(fresh)}
+    result = {"success":True,"data":serialize(fresh)}
+    if settings.get("_proximity_bluetooth_key"):
+        result["meta"] = {"bluetooth_host": {
+            "service": settings["proximity_ble_uuid"], "key": settings["_proximity_bluetooth_key"],
+        }}
+    return result
 @router.post("/{session_id}/end")
 def end(session_id:str,user=Depends(get_current_user)):
     if not ObjectId.is_valid(session_id): raise HTTPException(400,detail={"code":"INVALID_ID","message":"Identificador inválido"})
@@ -237,9 +247,19 @@ def rotate_qr(session_id:str,user=Depends(get_current_user),payload:dict|None=Bo
     if not doc or not allowed_teacher(db,user,doc): raise HTTPException(404,detail={"code":"NOT_FOUND","message":"Sesión no encontrada"})
     if doc.get("status")!="active": raise HTTPException(409,detail={"code":"SESSION_NOT_ACTIVE","message":"La clase no está activa"})
     now=datetime.now(timezone.utc)
-    if isinstance(payload, dict) and "teacher_location" in payload:
+    settings = {}
+    if isinstance(payload, dict) and payload.get("proximity_mode") == "bluetooth":
+        if user.get("role") != "teacher":
+            raise HTTPException(403, detail={"message":"Solo el docente de la sesión puede emitir por Bluetooth."})
+        from app.routers.academic.proximity import bluetooth_settings
+        settings = bluetooth_settings()
+    elif doc.get("bluetooth_checkin_required") and not (isinstance(payload, dict) and "teacher_location" in payload):
+        raise HTTPException(409, detail={"message":"Renueva el QR desde el teléfono del docente."})
+    elif isinstance(payload, dict) and "teacher_location" in payload:
         from app.routers.academic.proximity import gps_settings
         settings = gps_settings(payload["teacher_location"], now)
+        settings["bluetooth_checkin_required"] = False
+    if settings:
         updated = db.class_sessions.update_one({"_id":doc["_id"],"status":"active"},{"$set":settings})
         if not updated.matched_count:
             raise HTTPException(409,detail={"code":"SESSION_NOT_ACTIVE","message":"La clase no está activa"})
@@ -248,7 +268,12 @@ def rotate_qr(session_id:str,user=Depends(get_current_user),payload:dict|None=Bo
     import hashlib
     while db.qr_challenges.find_one({"code_hash":hashlib.sha256(code.encode()).hexdigest(),"revoked_at":None,"expires_at":{"$gt":now}}): code=f"{secrets.randbelow(10000):04d}"
     db.qr_challenges.insert_one({"session_id":session_id,"token_hash":hashlib.sha256(raw.encode()).hexdigest(),"code_hash":hashlib.sha256(code.encode()).hexdigest(),"created_at":now,"expires_at":now+timedelta(seconds=get_settings().qr_challenge_ttl_seconds),"revoked_at":None,"attempts":0})
-    return {"success":True,"data":{"token":raw,"code":code,"expires_at":now+timedelta(seconds=get_settings().qr_challenge_ttl_seconds),"image":qr_image(str(doc["_id"]), raw)}}
+    result = {"success":True,"data":{"token":raw,"code":code,"expires_at":now+timedelta(seconds=get_settings().qr_challenge_ttl_seconds),"image":qr_image(str(doc["_id"]), raw)}}
+    if settings.get("_proximity_bluetooth_key"):
+        result["meta"] = {"bluetooth_host": {
+            "service": settings["proximity_ble_uuid"], "key": settings["_proximity_bluetooth_key"],
+        }}
+    return result
 @router.post("/{session_id}/qr/revoke")
 def revoke_qr(session_id:str,user=Depends(get_current_user)):
     if not ObjectId.is_valid(session_id): raise HTTPException(400,detail={"code":"INVALID_ID","message":"Identificador inválido"})

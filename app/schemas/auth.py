@@ -17,6 +17,28 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=128)
 
 
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr
+
+
+class VerificationCodeRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=6, pattern=r"^[0-9]{6}$")
+
+
+class VerifyEmailRequest(ResendVerificationRequest, VerificationCodeRequest):
+    pass
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=12, max_length=128)
+
+
+class ChangeEmailRequest(BaseModel):
+    email: EmailStr
+    current_password: str = Field(min_length=1, max_length=128)
+
+
 class TokenResponse(BaseModel):
     success: bool = True
     data: dict

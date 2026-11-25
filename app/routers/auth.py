@@ -3,14 +3,25 @@ from collections import defaultdict, deque
 import time, secrets, base64, re
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pymongo.errors import PyMongoError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 from app.config import get_settings
 from app.database import get_database
 from app.dependencies import get_current_user, get_current_identity
-from app.schemas.auth import LoginRequest, RegisterRequest
+from app.schemas.auth import (
+    ChangeEmailRequest,
+    ChangePasswordRequest,
+    LoginRequest,
+    RegisterRequest,
+    ResendVerificationRequest,
+    VerificationCodeRequest,
+    VerifyEmailRequest,
+)
 from app.security import verify_password, create_access_token, hash_password, token_hash, opaque_token
 from app.services.users import create_user, public_user
 from app.services.email import send_password_reset_email
+from app.services.email_verification import send_verification_code, verify_email_code
+from app.services.email_change import confirm_email_change, request_email_change
+from app.services.password_change import confirm_password_change, request_password_change
 from app.services.institutions import institution, valid_timezone, now_utc
 from app.services.authorization import apply_user_context, resolve_user_context, user_contexts
 
@@ -41,9 +52,12 @@ def auth_user_response(db,user,context=None):
     return result
 
 @router.post("/register",status_code=201)
-def register(payload:RegisterRequest):
+def register(payload:RegisterRequest, request: Request):
     s=get_settings()
+    rate_limit(request, "register", 10, 3600)
     if not s.public_registration_enabled: raise HTTPException(403,detail={"code":"REGISTRATION_DISABLED","message":"El registro público está deshabilitado"})
+    if len(s.jwt_secret_key) < 32:
+        raise HTTPException(503, detail={"code": "AUTH_UNAVAILABLE", "message": "Registro temporalmente no disponible"})
     try:
         if payload.account_type not in ("student", "teacher"):
             raise HTTPException(422,detail={"code":"INVALID_ACCOUNT_TYPE","message":"Tipo de cuenta inválido"})
@@ -63,7 +77,8 @@ def register(payload:RegisterRequest):
         zone=valid_timezone(payload.timezone) if payload.timezone else None
         # Teacher registration never grants teaching privileges without institutional approval.
         user=create_user(email=str(payload.email),password=payload.password,role="student",full_name=payload.full_name,
-                         career_id=payload.career_id,institution_id=payload.institution_id,timezone_name=zone)
+                         career_id=payload.career_id,institution_id=payload.institution_id,timezone_name=zone,
+                         require_email_verification=True)
         if payload.institution_id:
             db.users.update_one({"_id":user["_id"]},{"$set":{"account_type":payload.account_type}})
             user["account_type"]=payload.account_type
@@ -89,10 +104,43 @@ def register(payload:RegisterRequest):
                     "reviewed_at":None,
                     "reason":None,
                 })
-        return {"success":True,"data":public_user(user),"message":"Cuenta creada correctamente"}
     except ValueError as exc: raise HTTPException(409,detail={"code":"EMAIL_EXISTS","message":str(exc)})
     except RuntimeError: raise HTTPException(503,detail={"code":"DATABASE_UNAVAILABLE","message":"Base de datos no disponible"})
     except PyMongoError: raise HTTPException(503,detail={"code":"DATABASE_ERROR","message":"No fue posible guardar la cuenta"})
+
+    try:
+        sent = send_verification_code(db, user["email"])
+    except PyMongoError:
+        sent = False
+    return {
+        "success": True,
+        "data": {**public_user(user), "email_verification_required": True, "verification_email_sent": sent},
+        "message": "Cuenta creada. Confirma tu correo para iniciar sesión.",
+    }
+
+@router.post("/verify-email")
+def verify_email(payload: VerifyEmailRequest, request: Request):
+    rate_limit(request, "verify-email", 30, 60)
+    db = get_database()
+    if db is None:
+        raise HTTPException(503, detail={"code": "DATABASE_UNAVAILABLE", "message": "Base de datos no disponible"})
+    if not verify_email_code(db, str(payload.email).lower().strip(), payload.code):
+        raise HTTPException(400, detail={
+            "code": "INVALID_VERIFICATION_CODE",
+            "message": "Código inválido, vencido o sin intentos disponibles.",
+        })
+    return {"success": True, "data": {"message": "Correo confirmado. Ya puedes iniciar sesión."}}
+
+
+@router.post("/resend-verification")
+def resend_verification(payload: ResendVerificationRequest, request: Request):
+    rate_limit(request, "resend-verification", 10, 3600)
+    db = get_database()
+    if db is None:
+        raise HTTPException(503, detail={"code": "DATABASE_UNAVAILABLE", "message": "Base de datos no disponible"})
+    send_verification_code(db, str(payload.email).lower().strip())
+    return {"success": True, "data": {"message": "Si puedes verificar tu cuenta, recibirás un código."}}
+
 
 @router.post("/login")
 def login(payload:LoginRequest,request:Request):
@@ -102,6 +150,11 @@ def login(payload:LoginRequest,request:Request):
     user=db.users.find_one({"email":str(payload.email).lower().strip()})
     if not user or not user.get("is_active",False) or not verify_password(payload.password,user.get("password_hash","")):
         raise HTTPException(401,detail={"code":"INVALID_CREDENTIALS","message":"Correo o contraseña incorrectos"})
+    if "email_verified_at" in user and user["email_verified_at"] is None:
+        raise HTTPException(403, detail={
+            "code": "EMAIL_NOT_VERIFIED",
+            "message": "Confirma tu correo para iniciar sesión.",
+        })
     contexts=user_contexts(db,user)
     context=contexts[0] if len(contexts)==1 else None
     return {"success":True,"data":{**issue_tokens(db,user,context),"user":auth_user_response(db,user,context)}}
@@ -164,17 +217,22 @@ def forgot_password(payload:dict,request:Request):
     email=str(payload.get("email","")).strip().lower()
     db=get_database()
     if db is not None and email:
+        now = datetime.now(timezone.utc)
         user=db.users.find_one({"email":email,"is_active":True})
         if user:
-            s=get_settings(); raw=opaque_token(); now=datetime.now(timezone.utc)
+            s=get_settings(); raw=opaque_token()
             db.password_reset_tokens.update_many({"user_id":user["_id"],"used_at":None},{"$set":{"used_at":now}})
             db.password_reset_tokens.insert_one({"user_id":user["_id"],"token_hash":token_hash(raw),"created_at":now,
               "expires_at":now+timedelta(minutes=s.password_reset_expire_minutes),"used_at":None})
             try: send_password_reset_email(email,raw)
-            except Exception:
+            except Exception as error:
                 # Do not disclose account existence or SMTP status to the caller.
                 import logging
-                logging.getLogger("checku.auth").warning("Password reset email delivery failed")
+                logging.getLogger("checku.auth").warning(
+                    "Password reset email delivery failed (%s, SMTP status=%s)",
+                    type(error).__name__,
+                    getattr(error, "smtp_code", None),
+                )
                 db.password_reset_tokens.update_one({"token_hash":token_hash(raw)},{"$set":{"used_at":now}})
     return {"success":True,"data":{"message":"Si la cuenta existe, recibirás instrucciones para recuperar tu contraseña."}}
 
@@ -189,19 +247,83 @@ def reset_password(payload:dict):
     if not item: raise HTTPException(400,detail={"code":"INVALID_RESET_TOKEN","message":"Token inválido o expirado"})
     result=db.password_reset_tokens.update_one({"_id":item["_id"],"used_at":None},{"$set":{"used_at":now}})
     if result.modified_count!=1: raise HTTPException(400,detail={"code":"INVALID_RESET_TOKEN","message":"Token inválido o expirado"})
-    db.users.update_one({"_id":item["user_id"]},{"$set":{"password_hash":hash_password(password),"updated_at":now}})
+    changed = db.users.update_one(
+        {"_id": item["user_id"], "$or": [
+            {"email_changed_at": {"$exists": False}},
+            {"email_changed_at": {"$lte": item["created_at"]}},
+        ]},
+        {"$set": {"password_hash": hash_password(password), "updated_at": now},
+         "$unset": {"password_change": "", "email_change": ""}},
+    )
+    if changed.matched_count != 1:
+        raise HTTPException(400, detail={"code": "INVALID_RESET_TOKEN", "message": "Token inválido o expirado"})
     db.refresh_sessions.update_many({"user_id":item["user_id"],"revoked_at":None},{"$set":{"revoked_at":now}})
     return {"success":True,"data":{"message":"Contraseña actualizada; inicia sesión nuevamente"}}
 
-@router.patch("/change-password")
-def change_password(payload:dict,user=Depends(get_current_user)):
-    current=payload.get("current_password",""); new=payload.get("new_password","")
-    if not verify_password(current,user.get("password_hash","")): raise HTTPException(400,detail={"code":"INVALID_PASSWORD","message":"La contraseña actual es incorrecta"})
-    if not isinstance(new,str) or len(new)<12 or len(new)>128: raise HTTPException(422,detail={"code":"INVALID_PASSWORD","message":"La nueva contraseña debe tener entre 12 y 128 caracteres"})
-    db=get_database(); now=datetime.now(timezone.utc)
-    db.users.update_one({"_id":user["_id"]},{"$set":{"password_hash":hash_password(new),"updated_at":now}})
-    db.refresh_sessions.update_many({"user_id":user["_id"],"revoked_at":None},{"$set":{"revoked_at":now}})
-    return {"success":True,"data":{"message":"Contraseña actualizada; vuelve a iniciar sesión"}}
+@router.patch("/change-password", status_code=202)
+def change_password(payload: ChangePasswordRequest, request: Request, user=Depends(get_current_identity)):
+    rate_limit(request, "change-password", 10, 60)
+    if not verify_password(payload.current_password, user.get("password_hash", "")):
+        raise HTTPException(400, detail={"code": "INVALID_PASSWORD", "message": "La contraseña actual es incorrecta"})
+    db = get_database()
+    if db is None:
+        raise HTTPException(503, detail={"code": "DATABASE_UNAVAILABLE", "message": "Base de datos no disponible"})
+    result = request_password_change(db, user, payload.new_password)
+    if result == "delivery_failed":
+        raise HTTPException(503, detail={"code": "VERIFICATION_EMAIL_FAILED", "message": "No se pudo enviar el código. Inténtalo de nuevo."})
+    if result == "unavailable":
+        raise HTTPException(429, detail={"code": "PASSWORD_CHANGE_UNAVAILABLE", "message": "Espera 60 segundos antes de solicitar otro código."})
+    return {"success": True, "data": {"verification_required": True, "message": "Enviamos un código al correo de tu cuenta."}}
+
+
+@router.post("/change-password/confirm")
+def confirm_change_password(payload: VerificationCodeRequest, request: Request, user=Depends(get_current_identity)):
+    rate_limit(request, "confirm-password-change", 30, 60)
+    db = get_database()
+    if db is None:
+        raise HTTPException(503, detail={"code": "DATABASE_UNAVAILABLE", "message": "Base de datos no disponible"})
+    if not confirm_password_change(db, user, payload.code):
+        raise HTTPException(400, detail={
+            "code": "INVALID_VERIFICATION_CODE",
+            "message": "Código inválido, vencido o sin intentos disponibles.",
+        })
+    return {"success": True, "data": {"message": "Contraseña actualizada. Vuelve a iniciar sesión."}}
+
+
+@router.post("/email-change", status_code=202)
+def change_email(payload: ChangeEmailRequest, request: Request, user=Depends(get_current_identity)):
+    rate_limit(request, "email-change", 10, 60)
+    if not verify_password(payload.current_password, user.get("password_hash", "")):
+        raise HTTPException(400, detail={"message": "La contraseña actual es incorrecta."})
+    email = str(payload.email).lower().strip()
+    if email == user["email"] and user.get("email_verified_at"):
+        raise HTTPException(400, detail={"message": "Este correo ya está verificado."})
+    db = get_database()
+    if db is None:
+        raise HTTPException(503, detail={"message": "Base de datos no disponible."})
+    if db.users.find_one({"email": email, "_id": {"$ne": user["_id"]}}, {"_id": 1}):
+        raise HTTPException(409, detail={"message": "Ya existe una cuenta con ese correo."})
+    result = request_email_change(db, user, email)
+    if result == "unavailable":
+        raise HTTPException(429, detail={"message": "Espera 60 segundos antes de solicitar otro código."})
+    if result == "delivery_failed":
+        raise HTTPException(503, detail={"message": "No se pudo enviar el código. Inténtalo de nuevo."})
+    return {"success": True, "data": {"email": email, "message": "Enviamos un código al correo indicado."}}
+
+
+@router.post("/email-change/confirm")
+def confirm_change_email(payload: VerifyEmailRequest, request: Request, user=Depends(get_current_identity)):
+    rate_limit(request, "confirm-email-change", 30, 60)
+    db = get_database()
+    if db is None:
+        raise HTTPException(503, detail={"message": "Base de datos no disponible."})
+    try:
+        verified = confirm_email_change(db, user, str(payload.email).lower().strip(), payload.code)
+    except DuplicateKeyError:
+        raise HTTPException(409, detail={"message": "Ya existe una cuenta con ese correo."})
+    if not verified:
+        raise HTTPException(400, detail={"message": "Código inválido, vencido o sin intentos disponibles."})
+    return {"success": True, "data": {"message": "Correo verificado y guardado."}}
 
 
 @router.patch('/profile')
