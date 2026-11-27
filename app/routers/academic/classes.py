@@ -72,33 +72,41 @@ def id_refs(value):
     return [value, ObjectId(value)] if ObjectId.is_valid(value) else [value]
 
 
-def assigned_tutor_ids(db, cls, institution_id=None):
+def assigned_tutor_ids(db, cls, institution_id=None, *, group_only=False):
     group = str(cls.get('group_id', ''))
     if institution_id:
         assignments = db.role_assignments.find({
             'institution_id': institution_id, 'role': 'tutor', 'scope_type': 'group',
             'scope_id': {'$in': id_refs(group)}, 'status': 'active',
         }, {'user_id': 1})
-        candidates = [ref for row in assignments for ref in id_refs(row.get('user_id'))]
+        if group_only:
+            assignments = assignments.sort([('assigned_at', -1), ('_id', -1)])
+        assigned = [str(row['user_id']) for row in assignments if row.get('user_id')]
+        candidates = [ref for uid in assigned for ref in id_refs(uid)]
         memberships = db.institution_memberships.find({
             'institution_id': institution_id, 'status': 'active', 'user_id': {'$in': candidates},
         }, {'user_id': 1})
-        refs = {str(row['user_id']) for row in memberships}
+        active = {str(row['user_id']) for row in memberships}
+        refs = [uid for uid in assigned if uid in active]
     else:
-        refs = set(map(str, cls.get('tutor_ids') or []))
-        for assignment in db.tutor_assignments.find({
+        refs = [] if group_only else list(map(str, cls.get('tutor_ids') or []))
+        assignments = db.tutor_assignments.find({
             'group_id': {'$in': id_refs(group)}, 'is_active': {'$ne': False},
             'is_deleted': {'$ne': True},
-        }):
+        })
+        if group_only:
+            assignments = assignments.sort([('updated_at', -1), ('_id', -1)])
+        for assignment in assignments:
             ref = str(assignment.get('tutor_id', ''))
             if ObjectId.is_valid(ref):
                 profile = db.tutors.find_one({'_id': ObjectId(ref)})
                 if not profile or (profile.get('is_active') is not False and not profile.get('is_deleted')):
-                    refs.add(str((profile or {}).get('user_id', ref)))
-    ids = [ObjectId(ref) for ref in refs if ObjectId.is_valid(ref)]
-    return sorted(row['_id'] for row in db.users.find({
+                    refs.append(str((profile or {}).get('user_id', ref)))
+    ids = [ObjectId(ref) for ref in dict.fromkeys(refs) if ObjectId.is_valid(ref)]
+    active_ids = {row['_id'] for row in db.users.find({
         '_id': {'$in': ids}, 'is_active': {'$ne': False}, 'is_deleted': {'$ne': True},
-    }, {'_id': 1}))
+    }, {'_id': 1})}
+    return [uid for uid in ids if uid in active_ids] if group_only else sorted(active_ids)
 
 
 def institutional_class_scope(db, user):
@@ -515,7 +523,8 @@ def class_community(class_id: str, user=Depends(get_current_user)):
     ids = [ObjectId(str(m['student_id'])) for m in members if ObjectId.is_valid(str(m.get('student_id', '')))]
     students = [serialize(x) for x in db.users.find({'_id': {'$in': ids}}, {'full_name': 1, 'avatar': 1, 'banner_color': 1, 'bio': 1})]
     teacher = db.users.find_one({'_id': ObjectId(str(doc['teacher_id']))}, {'full_name': 1, 'avatar': 1, 'banner_color': 1, 'bio': 1}) if ObjectId.is_valid(str(doc.get('teacher_id', ''))) else None
-    tutor_ids = assigned_tutor_ids(db, doc, user.get('institution_id'))
+    institution_id = user.get('institution_id') or doc.get('institution_id')
+    tutor_ids = assigned_tutor_ids(db, doc, institution_id, group_only=True)[:1]
     tutors = [serialize(x) for x in db.users.find({
         '_id': {'$in': tutor_ids}, 'is_active': {'$ne': False}, 'is_deleted': {'$ne': True},
     }, {'full_name': 1, 'avatar': 1, 'banner_color': 1, 'bio': 1})]

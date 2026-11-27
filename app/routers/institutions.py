@@ -114,6 +114,7 @@ def list_institution_members(institution_id:str,user=Depends(get_current_user)):
             'id':user_id,
             'full_name':users[user_id].get('full_name',''),
             'email':users[user_id].get('email',''),
+            'matricula':users[user_id].get('matricula'),
             'account_type':users[user_id].get('account_type',users[user_id].get('role')),
             'career_id':users[user_id].get('career_id'),
             'membership_status':membership.get('status'),

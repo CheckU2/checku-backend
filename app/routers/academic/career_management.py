@@ -74,11 +74,12 @@ def people(role: str = Query('student'), page: int = Query(1, ge=1), limit: int 
     if search and search.strip():
         from re import escape
         pattern = {"$regex": escape(search.strip()), "$options": "i"}
-        q = {"$and": [q, {"$or": [{"full_name": pattern}, {"email": pattern}]}]}
+        q = {"$and": [q, {"$or": [{"full_name": pattern}, {"email": pattern}, {"matricula": pattern}]}]}
     docs = list(db.users.find(q, {'password_hash': 0, 'avatar': 0}).sort('full_name', 1).skip((page-1)*limit).limit(limit))
     result = []
     for doc in docs:
         item = {'id': str(doc['_id']), 'full_name': doc.get('full_name', 'Sin nombre'), 'email': doc.get('email', ''), 'role': role}
+        item['matricula'] = doc.get('matricula')
         if doc.get('avatar_path') or doc.get('avatar'):
             item['avatar_url'] = f"/api/v1/users/{doc['_id']}/avatar"
         elif doc.get('avatar_url'):
