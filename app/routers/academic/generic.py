@@ -58,7 +58,7 @@ def make_router(prefix,collection,fields,admin_roles=None):
             query["tutor_id"]=user["_id"]
         return query
     @r.get("")
-    def list_items(page:int=Query(1,ge=1),limit:int=Query(20,ge=1,le=100),search:str|None=Query(None,max_length=80),career_id:str|None=None,user=Depends(get_current_user)):
+    def list_items(page:int=Query(1,ge=1),limit:int=Query(20,ge=1,le=100),search:str|None=Query(None,max_length=80),career_id:str|None=None,matricula:str|None=Query(None,max_length=40),user=Depends(get_current_user)):
         db=get_database(); q=scope(user)
         if not institutional_catalog(user) and user.get("role") not in admin_roles and (collection == "careers" or user.get("role") not in {"student","teacher","tutor"}):
             raise HTTPException(403,detail={"code":"FORBIDDEN","message":"Sin permisos"})
@@ -72,10 +72,25 @@ def make_router(prefix,collection,fields,admin_roles=None):
             if not ObjectId.is_valid(career_id):
                 raise HTTPException(422,detail={"message":"Selecciona una carrera válida"})
             filters.append({"career_id":{"$in":[career_id,ObjectId(career_id)]}})
+        people_catalog = collection in {"students","teachers","tutors"}
+        if people_catalog and matricula and matricula.strip():
+            from re import escape
+            exact={"$regex":"^"+escape(matricula.strip())+"$","$options":"i"}
+            users=db.users.find({"matricula":exact},{"_id":1})
+            refs=[ref for account in users for ref in (account["_id"],str(account["_id"]))]
+            person_filter={"user_id":{"$in":refs}}
+            filters.append({"$or":[person_filter,{"student_id":exact}]} if collection=="students" else person_filter)
         q = {"$and": filters} if len(filters) > 1 else q
         total=db[collection].count_documents(q)
         docs=db[collection].find(q).sort("created_at",DESCENDING).skip((page-1)*limit).limit(limit)
-        return {"success":True,"data":[serialize(x) for x in docs],"meta":{"page":page,"limit":limit,"total":total}}
+        rows=[serialize(x) for x in docs]
+        if people_catalog:
+            ids={ObjectId(str(row["user_id"])) for row in rows if ObjectId.is_valid(str(row.get("user_id","")))}
+            matriculas={str(account["_id"]):account.get("matricula") for account in db.users.find(
+                {"_id":{"$in":list(ids)}},{"matricula":1})}
+            for row in rows:
+                row["matricula"]=matriculas.get(str(row.get("user_id")))
+        return {"success":True,"data":rows,"meta":{"page":page,"limit":limit,"total":total}}
     @r.post("",status_code=201)
     def create_item(payload:dict,user=Depends(get_current_user)):
         if not institutional_catalog(user) and user.get("role") not in admin_roles: raise HTTPException(403,detail={"code":"FORBIDDEN","message":"Sin permisos"})

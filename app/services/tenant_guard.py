@@ -17,6 +17,12 @@ STUDENT_ROUTES = {
     ("POST", "/attendance/code/check-in"),
     ("POST", "/attendance/qr/check-in"),
     ("GET", "/reports/dashboard"),
+    ("GET", "/justifications"),
+    ("GET", "/justifications/options"),
+    ("GET", "/justifications/{justification_id}"),
+    ("GET", "/justifications/{justification_id}/messages"),
+    ("POST", "/justifications"),
+    ("POST", "/justifications/{justification_id}/messages"),
 }
 
 TEACHER_ROUTES = {
@@ -47,9 +53,6 @@ TEACHER_ROUTES = {
     ("GET", "/justifications/notifications"),
     ("GET", "/justifications/{justification_id}"),
     ("GET", "/justifications/{justification_id}/messages"),
-    ("POST", "/justifications/{justification_id}/approve"),
-    ("POST", "/justifications/{justification_id}/reject"),
-    ("POST", "/justifications/{justification_id}/messages"),
 }
 
 JUSTIFICATION_ROUTES = {
@@ -66,7 +69,7 @@ JUSTIFICATION_ROUTES = {
 ACADEMIC_REPORT_ROUTES = {
     ("GET", "/reports/academic"), ("GET", "/reports/academic/export"),
 }
-TEACHER_ROUTES |= ACADEMIC_REPORT_ROUTES | JUSTIFICATION_ROUTES | {("GET", "/attendance/calendar")}
+TEACHER_ROUTES |= ACADEMIC_REPORT_ROUTES | {("GET", "/attendance/calendar")}
 
 GROUP_ROSTER_ROUTES = {
     ("GET", "/groups"),

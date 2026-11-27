@@ -521,7 +521,7 @@ def class_community(class_id: str, user=Depends(get_current_user)):
         fail(403, 'FORBIDDEN', 'No puedes consultar esta clase')
     members = db.class_memberships.find({'class_id': {'$in': id_refs(doc['_id'])}}, {'student_id': 1})
     ids = [ObjectId(str(m['student_id'])) for m in members if ObjectId.is_valid(str(m.get('student_id', '')))]
-    students = [serialize(x) for x in db.users.find({'_id': {'$in': ids}}, {'full_name': 1, 'avatar': 1, 'banner_color': 1, 'bio': 1})]
+    students = [serialize(x) for x in db.users.find({'_id': {'$in': ids}}, {'full_name': 1, 'avatar': 1, 'banner_color': 1, 'bio': 1, 'matricula': 1})]
     teacher = db.users.find_one({'_id': ObjectId(str(doc['teacher_id']))}, {'full_name': 1, 'avatar': 1, 'banner_color': 1, 'bio': 1}) if ObjectId.is_valid(str(doc.get('teacher_id', ''))) else None
     institution_id = user.get('institution_id') or doc.get('institution_id')
     tutor_ids = assigned_tutor_ids(db, doc, institution_id, group_only=True)[:1]
@@ -529,7 +529,7 @@ def class_community(class_id: str, user=Depends(get_current_user)):
         '_id': {'$in': tutor_ids}, 'is_active': {'$ne': False}, 'is_deleted': {'$ne': True},
     }, {'full_name': 1, 'avatar': 1, 'banner_color': 1, 'bio': 1})]
     if user['role'] == 'student':
-        students = [person for person in students if person['id'] != uid]
+        students = [{key: value for key, value in person.items() if key != 'matricula'} for person in students if person['id'] != uid]
     return {'success': True, 'data': {'students': students, 'teacher': serialize(teacher) if teacher else None, 'tutors': tutors}}
 
 @router.post('/subjects', status_code=201)
@@ -585,10 +585,14 @@ def class_students(class_id: str, user=Depends(get_current_user)):
     if not ids:
         return {'success': True, 'data': []}
     students = db.users.find({'_id': {'$in': ids}, 'is_active': {'$ne': False}},
-                             {'full_name': 1, 'avatar_path': 1, 'avatar': 1})
-    rows = [{'id': str(u['_id']), 'full_name': u.get('full_name') or 'Alumno',
+                             {'full_name': 1, 'matricula': 1, 'avatar_path': 1, 'avatar': 1})
+    rows = [{'id': str(u['_id']), 'full_name': u.get('full_name') or 'Alumno', 'matricula': u.get('matricula'),
              'avatar_url': f"/api/v1/users/{u['_id']}/avatar" if u.get('avatar_path') or u.get('avatar') else None}
             for u in students]
+    if user['role'] == 'student':
+        for row in rows:
+            if row['id'] != str(user['_id']):
+                row.pop('matricula', None)
     rows.sort(key=lambda u: u['full_name'].casefold())
     return {'success': True, 'data': rows}
 

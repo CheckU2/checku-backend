@@ -107,7 +107,9 @@ def academic_report(db, user, days, group_id=None, class_id=None, student_id=Non
         if metadata and cid in selected:
             details.append({"id": sid, "class_id": cid, "date": local.strftime("%Y-%m-%d %H:%M"), "marks": marks})
 
-    learners = [{"id": uid, "name": people.get(uid) or "Alumno", "counts": dict(counts[uid]), "percentage": percentage(counts[uid])}
+    matriculas = {str(row["_id"]): row.get("matricula") for row in db.users.find(
+        {"_id":{"$in":[ObjectId(uid) for uid in roster if ObjectId.is_valid(uid)]}}, {"matricula":1})}
+    learners = [{"id": uid, "matricula": matriculas.get(uid), "name": people.get(uid) or "Alumno", "counts": dict(counts[uid]), "percentage": percentage(counts[uid])}
                 for uid in sorted(roster, key=lambda uid: ((people.get(uid) or "").casefold(), uid)) if not student_id or uid == student_id]
     groups = [{"id": gid, "name": names["group"].get(gid) or "Grupo", "counts": dict(values), "percentage": percentage(values)}
               for gid, values in comparison.items()]
@@ -123,6 +125,7 @@ def academic_report(db, user, days, group_id=None, class_id=None, student_id=Non
         records = db.justifications.find(query, {"student_id": 1, "reason": 1, "status": 1}).sort("created_at", -1)
         result["justifications"] = [
             {"id": str(row["_id"]), "name": people.get(str(row.get("student_id"))) or "Alumno",
+             "matricula": matriculas.get(str(row.get("student_id"))),
              "reason": row.get("reason", ""), "status": row.get("status", "pending")}
             for row in records
         ]

@@ -400,8 +400,6 @@ def update_my_profile(payload: dict, user=Depends(get_current_user)):
     db = get_database()
     changes = {}
     if 'matricula' in payload:
-        if user.get('role') not in {'student', 'teacher'}:
-            raise HTTPException(403, detail={'message': 'Solo alumnos y docentes pueden editar su matrícula'})
         matricula = payload['matricula']
         if matricula is not None and (not isinstance(matricula, str) or len(matricula.strip()) > 40):
             raise HTTPException(422, detail={'message': 'La matrícula debe ser un texto de hasta 40 caracteres'})

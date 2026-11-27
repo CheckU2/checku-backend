@@ -1,3 +1,4 @@
+from re import escape
 from datetime import datetime,timezone
 from bson import ObjectId
 from fastapi import APIRouter,Depends,HTTPException,Query
@@ -64,9 +65,14 @@ def create_user_route(payload:UserCreate,admin=Depends(require_roles("super_admi
  return {"success":True,"data":public_user(user)}
 
 @router.get("")
-def list_users(page:int=Query(1,ge=1),limit:int=Query(20,ge=1,le=100),user=Depends(get_current_user)):
+def list_users(page:int=Query(1,ge=1),limit:int=Query(20,ge=1,le=100),matricula:str=Query("",max_length=40),search:str=Query("",max_length=120),user=Depends(get_current_user)):
  if user.get("role") not in {"super_admin","admin"}: raise HTTPException(403,detail={"code":"FORBIDDEN","message":"Sin permisos"})
- db=dbx(); q=scoped_query(user); total=db.users.count_documents(q)
+ db=dbx(); q=scoped_query(user)
+ if matricula.strip(): q["matricula"]={"$regex":"^"+escape(matricula.strip())+"$","$options":"i"}
+ if search.strip():
+  pattern={"$regex":escape(search.strip()),"$options":"i"}
+  q={"$and":[q,{"$or":[{"full_name":pattern},{"email":pattern}]}]}
+ total=db.users.count_documents(q)
  docs=db.users.find(q,{"password_hash":0}).sort("created_at",DESCENDING).skip((page-1)*limit).limit(limit)
  return {"success":True,"data":[public_user(x) for x in docs],"meta":{"page":page,"limit":limit,"total":total}}
 @router.get("/{user_id}")
