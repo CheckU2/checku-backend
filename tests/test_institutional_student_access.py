@@ -72,6 +72,11 @@ def make_request(method, path):
         ("POST", "/classes/join"),
         ("GET", "/classes/{class_id}/community"),
         ("GET", "/attendance/me"),
+        ("GET", "/justifications"),
+        ("GET", "/justifications/options"),
+        ("POST", "/justifications"),
+        ("GET", "/justifications/{justification_id}/messages"),
+        ("POST", "/justifications/{justification_id}/messages"),
         ("GET", "/reports/dashboard"),
     ],
 )
@@ -93,7 +98,6 @@ def test_institutional_students_can_use_scoped_routes(method, path):
         ("POST", "/sessions/{session_id}/start"),
         ("GET", "/reports/dashboard"),
         ("GET", "/justifications"),
-        ("POST", "/justifications/{justification_id}/approve"),
     ],
 )
 def test_institutional_teachers_can_use_scoped_work_routes(method, path):
@@ -106,6 +110,9 @@ def test_institutional_teachers_can_use_scoped_work_routes(method, path):
     ("method", "path", "account"),
     [
         ("GET", "/classes/options", {"role": "student", "account_type": "student"}),
+        ("POST", "/justifications/{justification_id}/approve", {"role": "student", "account_type": "student"}),
+        ("POST", "/justifications", {"role": "teacher", "account_type": "teacher"}),
+        ("POST", "/justifications/{justification_id}/approve", {"role": "teacher", "account_type": "teacher"}),
         ("GET", "/other/classes", {"role": "student", "account_type": "student"}),
         ("POST", "/classes/subjects", {"role": "institution_admin"}),
         ("POST", "/classes", {"role": "student", "account_type": "student"}),

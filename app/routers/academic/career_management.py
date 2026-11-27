@@ -66,19 +66,22 @@ def overview(user=Depends(get_current_user)):
     }}
 
 @router.get('/people')
-def people(role: str = Query('student'), page: int = Query(1, ge=1), limit: int = Query(30, ge=1, le=100), search: str | None = Query(None, max_length=80), user=Depends(get_current_user)):
+def people(role: str = Query('student'), page: int = Query(1, ge=1), limit: int = Query(30, ge=1, le=100), search: str | None = Query(None, max_length=80), matricula: str = Query("", max_length=40), user=Depends(get_current_user)):
     db, career = context(user)
     if role not in {'student', 'teacher', 'tutor'}:
         raise HTTPException(422, detail='Rol no permitido')
     q = people_filter(db, user, career, role)
+    from re import escape
     if search and search.strip():
-        from re import escape
         pattern = {"$regex": escape(search.strip()), "$options": "i"}
-        q = {"$and": [q, {"$or": [{"full_name": pattern}, {"email": pattern}]}]}
+        q = {"$and": [q, {"$or": [{"full_name": pattern}, {"email": pattern}, {"matricula": pattern}]}]}
+    if matricula.strip():
+        q = {"$and": [q, {"matricula": {"$regex": "^"+escape(matricula.strip())+"$", "$options": "i"}}]}
     docs = list(db.users.find(q, {'password_hash': 0, 'avatar': 0}).sort('full_name', 1).skip((page-1)*limit).limit(limit))
     result = []
     for doc in docs:
         item = {'id': str(doc['_id']), 'full_name': doc.get('full_name', 'Sin nombre'), 'email': doc.get('email', ''), 'role': role}
+        item['matricula'] = doc.get('matricula')
         if doc.get('avatar_path') or doc.get('avatar'):
             item['avatar_url'] = f"/api/v1/users/{doc['_id']}/avatar"
         elif doc.get('avatar_url'):
@@ -134,9 +137,9 @@ def group_members(group_id: str, user=Depends(get_current_user)):
         }, {'user_id': 1})
         people_query['_id'] = {'$in': [ObjectId(str(member['user_id'])) for member in memberships
                                        if ObjectId.is_valid(str(member.get('user_id', '')))]}
-    users = db.users.find(people_query, {'full_name': 1, 'email': 1, 'avatar_path': 1}).sort('full_name', 1)
+    users = db.users.find(people_query, {'full_name': 1, 'email': 1, 'avatar_path': 1, 'matricula': 1}).sort('full_name', 1)
     return {'success': True, 'data': {'group': serialize(group), 'students': [
-        {'id': str(u['_id']), 'full_name': u.get('full_name', ''), 'email': u.get('email', ''), 'avatar_url': f"/api/v1/users/{u['_id']}/avatar" if u.get('avatar_path') else None} for u in users]}}
+        {'id': str(u['_id']), 'full_name': u.get('full_name', ''), 'email': u.get('email', ''), 'matricula': u.get('matricula'), 'avatar_url': f"/api/v1/users/{u['_id']}/avatar" if u.get('avatar_path') else None} for u in users]}}
 
 @router.post('/groups/{group_id}/tutor')
 def assign_tutor(group_id: str, payload: dict, user=Depends(get_current_user)):

@@ -177,14 +177,14 @@ def session_report(session_id: str, user=Depends(get_current_user)):
         memberships = [m for m in memberships if not m.get('joined_at') or m['joined_at'] <= ended]
     uids = [str(m['student_id']) for m in memberships]
     valid = [ObjectId(x) for x in uids if ObjectId.is_valid(x)]
-    users = {str(u['_id']): u for u in db.users.find({'_id': {'$in': valid}}, {'full_name': 1, 'avatar_url': 1, 'profile_photo': 1})}
+    users = {str(u['_id']): u for u in db.users.find({'_id': {'$in': valid}}, {'full_name': 1, 'avatar_url': 1, 'profile_photo': 1, 'matricula': 1})}
     attendance = attendance_records(db, [session_id], uids)
     entries = []
     for uid in uids:
         a = attendance.get((session_id, uid))
         profile = users.get(uid, {})
         recorded_at = a.get('recorded_at') if a else None
-        entries.append({'student_id': uid, 'full_name': profile.get('full_name', 'Alumno'), 'avatar_url': profile.get('avatar_url') or profile.get('profile_photo'), 'status': a.get('status', 'absent' if session.get('status') == 'closed' else 'pending') if a else ('absent' if session.get('status') == 'closed' else 'pending'), 'recorded_at': as_utc(recorded_at) if isinstance(recorded_at, datetime) else recorded_at})
+        entries.append({'student_id': uid, 'full_name': profile.get('full_name', 'Alumno'), 'matricula': profile.get('matricula'), 'avatar_url': profile.get('avatar_url') or profile.get('profile_photo'), 'status': a.get('status', 'absent' if session.get('status') == 'closed' else 'pending') if a else ('absent' if session.get('status') == 'closed' else 'pending'), 'recorded_at': as_utc(recorded_at) if isinstance(recorded_at, datetime) else recorded_at})
     counts = {key: sum(x['status'] == key for x in entries) for key in ('present','late','absent','excused','pending')}
     return {'success': True, 'data': {'session': details(db, session), 'students': entries, 'counts': counts, 'departure_tracking': False}}
 
