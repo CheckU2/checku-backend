@@ -9,6 +9,7 @@ def test_attendance_percentage_and_risk():
     assert attendance_percentage(present=7,late=0,excused=1,evaluable_sessions=10)==80.0
     assert not is_at_risk(80.0)
     assert is_at_risk(79.99)
+    
     assert attendance_percentage(present=0,late=0,excused=0,evaluable_sessions=0) is None
 
 def test_negative_counts_rejected():
